@@ -12,6 +12,9 @@ PREV = STATE / "findings.prev.md"
 HISTORY = HOME / "history.jsonl"
 PROJECTS = HOME / "projects"
 PROMPT_MAX = 300
+LONG_TURNS = 30  # a Session with this many typed prompts counts as long
+CACHE_WRITE_HEAVY = 50_000  # cache-write tokens in one turn
+CLAUDE_MD_LINES = 200
 # Record types the digest knows about or deliberately drops; anything else counts as format drift.
 KNOWN_TYPES = {
     "assistant", "attachment", "user", "api-request-blob", "mode", "atis-latch", "last-prompt",
@@ -111,7 +114,11 @@ def digest_session(path, lo, hi, parent_cut=None):
          "skills_invoked": collections.Counter(), "slash": collections.Counter(),
          "attrib_skill_out": collections.Counter(), "tool_errors": [], "denials": collections.Counter(),
          "interrupts": 0, "compactions": [], "api_errors": 0, "informational": [], "turns": [],
-         "perm_modes": collections.Counter()}
+         "perm_modes": collections.Counter(), "denied": collections.Counter(),
+         "prompted_by": collections.Counter(), "tokens_by_model": collections.defaultdict(collections.Counter),
+         "tokens_by_effort": collections.defaultdict(collections.Counter), "cache_heavy": [],
+         "ctx_sum": 0, "first_ctx": 0}
+    tool_by_uuid = {}
     listing = None
     reqs, cur, first, last, cut, drift, seen_user = {}, None, None, None, None, 0, False
     cutoff = parent_cut or "￿"
@@ -153,7 +160,7 @@ def digest_session(path, lo, hi, parent_cut=None):
                 d["cost_usd"] = max(d.get("cost_usd", 0), r.get("totalCostUSD") or 0)
             elif t == "assistant":
                 m = r.get("message") or {}
-                reqs[r.get("requestId") or r.get("uuid")] = (m.get("model"), m.get("usage") or {}, r.get("attributionSkill"))
+                reqs[r.get("requestId") or r.get("uuid")] = (m.get("model"), m.get("usage") or {}, r.get("attributionSkill"), str(r.get("effort")), cur)
                 d["effort"][str(r.get("effort"))] += 1
                 if r.get("isApiErrorMessage"):
                     d["api_errors"] += 1
@@ -164,19 +171,29 @@ def digest_session(path, lo, hi, parent_cut=None):
                         if cur:
                             cur["tools"][n] += 1
                         inp = c.get("input") or {}
+                        head = ""
                         if n == "Skill":
                             d["skills_invoked"][inp.get("skill")] += 1
                         if n == "Bash":
                             cmd = (inp.get("command") or "").strip().split()
                             if cmd:
-                                d["bash_heads"][" ".join(cmd[:2]) if cmd[0] in ("git", "gh", "npm", "uv", "claude", "openspec") else cmd[0]] += 1
+                                head = " ".join(cmd[:2]) if cmd[0] in ("git", "gh", "npm", "uv", "claude", "openspec") else cmd[0]
+                                d["bash_heads"][head] += 1
+                        tool_by_uuid[r.get("uuid")] = tool_by_uuid[c.get("id")] = f"{n} {head}".strip()
             elif t == "user":
                 c = (r.get("message") or {}).get("content")
+                tids = [x.get("tool_use_id") for x in c if isinstance(x, dict)] if isinstance(c, list) else []
+                src = next((tool_by_uuid[i] for i in tids if i in tool_by_uuid), tool_by_uuid.get(r.get("sourceToolAssistantUUID"), "?"))
                 if r.get("toolDenialKind"):
                     d["denials"][r["toolDenialKind"]] += 1
+                    d["denied"][f"{src} [{r['toolDenialKind']}]"] += 1
                 pd = r.get("permissionDecision") or {}
                 if pd.get("decision") == "reject" or (pd.get("source") or "").startswith("user"):
                     d["denials"]["pd:%s/%s" % (pd.get("decision"), pd.get("source"))] += 1
+                    if pd.get("decision") == "reject" and not r.get("toolDenialKind"):
+                        d["denied"][f"{src} [reject]"] += 1
+                if (pd.get("source") or "").startswith("user") and pd.get("decision") == "accept":
+                    d["prompted_by"][src] += 1
                 if isinstance(c, list):
                     for x in c:
                         if isinstance(x, dict) and x.get("type") == "tool_result" and x.get("is_error"):
@@ -218,21 +235,124 @@ def digest_session(path, lo, hi, parent_cut=None):
                     listing = a.get("names")
         except Exception:
             drift += 1
-    for model, u, sk in reqs.values():
+    for i, (model, u, sk, effort, turn) in enumerate(reqs.values()):
         d["models"][model] += 1
         tok = {"in": u.get("input_tokens", 0), "cache_read": u.get("cache_read_input_tokens", 0),
                "cache_write": u.get("cache_creation_input_tokens", 0), "out": u.get("output_tokens", 0),
                "thinking": (u.get("output_tokens_details") or {}).get("thinking_tokens", 0)}
         d["tokens"].update(tok)
-        d["peak_ctx"] = max(d["peak_ctx"], tok["in"] + tok["cache_read"] + tok["cache_write"])
+        d["tokens_by_model"][model].update(tok)
+        d["tokens_by_effort"][effort].update(tok)
+        ctx = tok["in"] + tok["cache_read"] + tok["cache_write"]
+        d["peak_ctx"] = max(d["peak_ctx"], ctx)
+        d["ctx_sum"] += ctx
+        if i == 0:
+            d["first_ctx"] = ctx
+        if turn is not None:
+            turn["_cw"] = turn.get("_cw", 0) + tok["cache_write"]
         if sk:
             d["attrib_skill_out"][sk] += tok["out"]
+    for t in d["turns"]:
+        cw = t.pop("_cw", 0)
+        if cw >= CACHE_WRITE_HEAVY:
+            d["cache_heavy"].append({"ts": t["ts"], "cache_write": cw, "prompt": t["prompt"][:80]})
     d["start"], d["end"], d["requests"] = first, last, len(reqs)
     d["versions"] = sorted(d["versions"])
     d["tool_errors"] = collections.Counter(d["tool_errors"]).most_common(10)
     d["bash_heads"] = dict(d["bash_heads"].most_common(15))
     d["listing"] = listing
     return (d if first else None), cut, drift
+
+
+def instruction_files(dg):
+    """CLAUDE.md files over the line limit, or changed or grown during the Window."""
+    lo = dg["window"]["start"]
+    lo_epoch = datetime.fromisoformat(lo.replace("Z", "+00:00")).timestamp()
+    dirs = {Path(d["cwd"]) for d in dg["sessions"] if d.get("cwd") and "agentId" not in d}
+    paths = {HOME / "CLAUDE.md"} | {p / n for p in dirs for n in ("CLAUDE.md", ".claude/CLAUDE.md")}
+    out = []
+    for f in sorted(paths):
+        try:
+            lines = len(f.read_text(errors="replace").splitlines())
+            changed = f.stat().st_mtime >= lo_epoch
+        except OSError:
+            continue
+        grew = None
+        try:
+            log = subprocess.run(["git", "-C", str(f.parent), "log", f"--since={lo}", "--numstat", "--format=", "--", f.name],
+                                 capture_output=True, text=True, timeout=10).stdout
+            grew = sum(int(a) - int(b) for a, b, _ in (l.split("\t") for l in log.splitlines() if l.count("\t") == 2) if a.isdigit() and b.isdigit())
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if lines > CLAUDE_MD_LINES or changed or (grew or 0) > 0:
+            out.append({"file": str(f), "lines": lines, "over_limit": lines > CLAUDE_MD_LINES,
+                        "changed_in_window": changed, "net_lines_added_in_window": grew})
+    return out
+
+
+def compute_metrics(dg):
+    """Numbers and rubric candidates for categories 2, 5 and 7. Writes no Finding."""
+    ss = dg["sessions"]
+    mains = [d for d in ss if "agentId" not in d]
+    top = lambda c, n=15: dict(collections.Counter(c).most_common(n))
+    tok_total = lambda c: c.get("in", 0) + c.get("cache_write", 0) + c.get("out", 0)
+
+    def row(d):
+        return {"file": d["file"], "project": d.get("cwd"), "turns": len(d["turns"]), "peak_ctx": d["peak_ctx"],
+                "mean_ctx": d["ctx_sum"] // d["requests"] if d["requests"] else 0,
+                "compactions": d["compactions"], "clear": d["slash"].get("clear", 0), "compact": d["slash"].get("compact", 0)}
+
+    rows = [row(d) for d in mains if d["requests"]]
+    no_clear = [d["file"] for d in mains if d["interrupts"] >= 2 and not d["slash"].get("clear")]
+    context = {
+        "sessions": len(rows),
+        "mean_peak_ctx": sum(r["peak_ctx"] for r in rows) // max(len(rows), 1),
+        "top_peak": sorted(rows, key=lambda r: -r["peak_ctx"])[:15],
+        "compactions_total": sum(len(r["compactions"]) for r in rows),
+        "clear_total": sum(r["clear"] for r in rows), "compact_total": sum(r["compact"] for r in rows),
+        "long_sessions": sorted([r for r in rows if r["turns"] >= LONG_TURNS], key=lambda r: -r["turns"])[:15],
+        "instruction_files": instruction_files(dg),
+        "rubric_candidates": [f"{len(no_clear)} Sessions had 2+ interrupts and no /clear: {no_clear[:10]}"] if no_clear else [],
+    }
+    by = lambda key: collections.defaultdict(collections.Counter)
+    by_project, by_model, by_effort = by(0), by(0), by(0)
+    usd_project, skill_out = collections.Counter(), collections.Counter()
+    allt = collections.Counter()
+    for d in ss:
+        proj = d.get("cwd")
+        by_project[proj].update(d["tokens"])
+        usd_project[proj] += d.get("cost_usd", 0)
+        allt.update(d["tokens"])
+        skill_out.update(d["attrib_skill_out"])
+        for m, c in d["tokens_by_model"].items():
+            by_model[m].update(c)
+        for e, c in d["tokens_by_effort"].items():
+            by_effort[e].update(c)
+    ctx_in = allt["in"] + allt["cache_read"] + allt["cache_write"]
+    firsts = sorted(d["first_ctx"] for d in mains if d["requests"])
+    cost = {
+        "tokens": dict(allt), "usd_total": round(sum(usd_project.values()), 2),
+        "cache_hit_ratio": round(allt["cache_read"] / ctx_in, 3) if ctx_in else None,
+        "by_project": {p: {**dict(c), "usd": round(usd_project[p], 2)} for p, c in sorted(by_project.items(), key=lambda x: -tok_total(x[1]))[:10]},
+        "by_model": {m: dict(c) for m, c in by_model.items()},
+        "by_effort": {e: dict(c) for e, c in by_effort.items()},
+        "output_tokens_by_skill": top(skill_out, 10),
+        "top_sessions": [{"file": d["file"], "usd": d.get("cost_usd"), **dict(d["tokens"])}
+                         for d in sorted(mains, key=lambda d: -tok_total(d["tokens"]))[:10]],
+        "cache_heavy_turns": sorted([{"file": d["file"], **t} for d in ss for t in d["cache_heavy"]], key=lambda t: -t["cache_write"])[:10],
+        "expensive_subagents": [{"file": d["file"], "agent": d.get("agent"), **dict(d["tokens"])}
+                                for d in sorted([d for d in ss if "agentId" in d], key=lambda d: -tok_total(d["tokens"]))[:5]],
+        "fixed_overhead_ctx": {"median": firsts[len(firsts) // 2] if firsts else 0,
+                               "mean": sum(firsts) // max(len(firsts), 1), "sessions": len(firsts)},
+    }
+    denied, prompted, kinds = collections.Counter(), collections.Counter(), collections.Counter()
+    for d in ss:
+        denied.update(d["denied"])
+        prompted.update(d["prompted_by"])
+        kinds.update(d["denials"])
+    permissions = {"prompts_answered": sum(prompted.values()), "prompted_by_tool": top(prompted),
+                   "denied_by_tool_and_kind": top(denied), "denial_kinds": dict(kinds)}
+    return {"context": context, "cost": cost, "permissions": permissions}
 
 
 def build_digest(start):
@@ -319,6 +439,7 @@ def prepare(redo):
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
+    (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
     print(usage_line())
     if hint:
@@ -332,7 +453,10 @@ def commit(draft):
     state = json.loads((tmp / "state.json").read_text())
     STATE.mkdir(parents=True, exist_ok=True)
     new = FINDINGS.with_suffix(".md.tmp")
-    new.write_text(f"---\nretro_timestamp: {state['timestamp']}\n---\n\n{draft.read_text()}")
+    body = draft.read_text()
+    n = len(re.findall(r"^### \d+\.", body, re.M))
+    body = re.sub(r"Findings: \d+", f"Findings: {n}", body, count=1)
+    new.write_text(f"---\nretro_timestamp: {state['timestamp']}\n---\n\n{body}")
     if not state["redo"] and FINDINGS.exists():
         FINDINGS.replace(PREV)
     new.replace(FINDINGS)
