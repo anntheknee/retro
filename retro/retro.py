@@ -127,7 +127,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
     """
     d = {"file": str(path.relative_to(PROJECTS)), "versions": set(), "models": collections.Counter(),
          "effort": collections.Counter(), "tokens": collections.Counter(), "peak_ctx": 0,
-         "tools": collections.Counter(), "bash_heads": collections.Counter(),
+         "tools": collections.Counter(), "bash_heads": collections.Counter(), "bash_words": set(),
          "skills_invoked": collections.Counter(), "slash": collections.Counter(),
          "attrib_skill_out": collections.Counter(), "tool_errors": [], "denials": collections.Counter(),
          "interrupts": 0, "compactions": [], "api_errors": 0, "informational": [], "turns": [],
@@ -204,6 +204,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
                         if n == "Bash":
                             cmd = (inp.get("command") or "").strip().split()
                             if cmd:
+                                d["bash_words"].add(cmd[0])
                                 head = " ".join(cmd[:2]) if cmd[0] in ("git", "gh", "npm", "uv", "claude", "openspec") else cmd[0]
                                 d["bash_heads"][head] += 1
                         tool_by_uuid[r.get("uuid")] = tool_by_uuid[c.get("id")] = f"{n} {head}".strip()
@@ -311,6 +312,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
     d["versions"] = sorted(d["versions"])
     d["tool_errors"] = collections.Counter(d["tool_errors"]).most_common(10)
     d["bash_heads"] = dict(d["bash_heads"].most_common(15))
+    d["bash_words"] = sorted(d["bash_words"])
     d["listing"] = listing
     return (d if first else None), cut, drift
 
@@ -718,11 +720,56 @@ def vkey(v):
     return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.+-]", v.lstrip("v")))
 
 
+def cli_package(word):
+    """The brew formula or npm-global package a Bash command word resolves to, else None."""
+    exe = shutil.which(word)
+    if not exe:
+        return None
+    real = Path(exe).resolve().parts
+    for marker in ("Cellar", "node_modules"):
+        if marker in real:
+            i = len(real) - 1 - real[::-1].index(marker)  # the innermost marker
+            if i + 1 < len(real):
+                name = real[i + 1]
+                return name + "/" + real[i + 2] if name.startswith("@") and i + 2 < len(real) else name
+    return None
+
+
+def run_outdated(cmd):
+    """`npm outdated` exits 1 when something is outdated, so only unparseable output is a failure."""
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        return json.loads(out.stdout or "{}")
+    except ValueError:
+        raise RuntimeError((out.stderr or "no JSON").strip()[:200])
+
+
+def build_clis(dg):
+    """Installed CLIs, which the Window used, and which are outdated. Raises if the installed list can't be built."""
+    installed = {n.rsplit("/", 1)[-1]: "brew" for n in subprocess.run(
+        ["brew", "leaves", "--installed-on-request"], capture_output=True, text=True, timeout=60, check=True).stdout.split()}
+    npm = json.loads(subprocess.run(["npm", "ls", "-g", "--depth=0", "--json"], capture_output=True, text=True, timeout=60).stdout or "{}")
+    installed.update({n: "npm" for n in npm.get("dependencies", {})})
+    installed["claude"] = "claude"
+    used = {cli_package(w) or ("claude" if w == "claude" else None) for d in dg["sessions"] for w in d.get("bash_words", [])}
+    used = sorted(n for n in used if n in installed)
+    outdated = {}
+    for n in (o for o in run_outdated(["brew", "outdated", "--json=v2"]).get("formulae", []) if o["name"] in installed):
+        outdated[n["name"]] = (n["installed_versions"][-1], n["current_version"], "brew upgrade " + n["name"])
+    for n, o in run_outdated(["npm", "outdated", "-g", "--json"]).items():
+        if n in installed:
+            o = o[-1] if isinstance(o, list) else o  # one entry per location
+            outdated[n] = (o.get("current", "?"), o.get("latest", "?"), "npm install -g " + n)
+    return {"installed": sorted(installed), "used": used,
+            "outdated_used": [{"name": n, "installed": v[0], "latest": v[1], "update": v[2]} for n, v in sorted(outdated.items()) if n in used],
+            "unused_outdated": [f"{n} {v[0]} → {v[1]} · not used this Window" for n, v in sorted(outdated.items()) if n not in used]}
+
+
 def build_upstream(dg, since, tk=None):
     """What is behind upstream, as plain data for the main session. Each part tolerates a failed call."""
     tk = tk or build_toolkit(dg)
     uses = {r["name"]: r["uses"] for r in tk["items"]}
-    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "errors": []}
+    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "clis": None, "errors": []}
 
     def attempt(what, fn):
         try:
@@ -810,6 +857,7 @@ def build_upstream(dg, since, tk=None):
                                   "releases_since_cursor": sorted((v for v, t in vs.items() if t > since), key=vkey)[-60:],
                                   "upstream_of": "built-in commands, bundled skills and agents"}
     attempt("claude code", claude_code)
+    out["clis"] = attempt("clis", lambda: build_clis(dg))
     return out
 
 
@@ -851,7 +899,9 @@ def prepare(redo):
             inp["previous_findings"] = prev[a]
         (tmp / f"agent_{a}.json").write_text(json.dumps(inp, default=_json_default, separators=(",", ":")))
     (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
-    (tmp / "upstream.json").write_text(json.dumps(build_upstream(dg, cursor(redo, start)), separators=(",", ":")))
+    up = build_upstream(dg, cursor(redo, start))
+    (tmp / "upstream.json").write_text(json.dumps(up, separators=(",", ":")))
+    (tmp / "clis.json").write_text(json.dumps((up["clis"] or {}).get("installed", []), separators=(",", ":")))  # for the news filter
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
