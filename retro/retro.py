@@ -34,7 +34,10 @@ KNOWN_TYPES = {
 
 # Built-in slash commands users type; not on disk, so listed here. Bundled skills come from the skill listing.
 BUILTIN_COMMANDS = ["clear", "compact", "context", "cost", "doctor", "help", "init", "insights", "model", "rewind",
-                    "resume", "review", "usage", "config", "memory", "permissions", "plan", "btw", "rename"]
+                    "resume", "review", "usage", "config", "memory", "permissions", "plan", "btw", "rename",
+                    "status", "mcp", "agents", "hooks", "login", "logout", "export", "vim", "add-dir", "terminal-setup",
+                    "bug", "output-style", "statusline", "ide", "pr-comments", "release-notes", "theme", "fast", "color",
+                    "effort", "new", "plugin", "reload-plugins", "skills", "rc", "diff", "skill-doctor", "opusplan"]
 
 SKELETON = """Sessions: {sessions} · Projects: {projects} · Findings: 0
 
@@ -603,7 +606,8 @@ def build_toolkit(dg):
         for sk in load_json(m).get("skills", []):
             if sk.get("name"):
                 add("anthropic-skills:" + sk["name"], f"claude.ai synced ({sk.get('source')})", True, sk.get("description"))
-    for cwd in sorted({d["cwd"] for d in dg["sessions"] if d.get("cwd") and "agentId" not in d}):
+    cwds = {d["cwd"] for d in dg["sessions"] if d.get("cwd") and "agentId" not in d}
+    for cwd in sorted(cwds | {h["project"] for h in dg["history"] if h.get("project")}):
         proj = Path(cwd) / ".claude"
         if proj == HOME:
             continue
@@ -646,11 +650,28 @@ def build_toolkit(dg):
     return {"items": sorted(rows.values(), key=lambda r: r["name"]), "plugins": plugins}
 
 
+def dead_slash(dg, items):
+    """Slash names typed in the Window that match no Toolkit item (a plugin item matches by its bare name too)."""
+    known = {r["name"] for r in items}
+    known |= {n.split(":", 1)[1] for n in known if ":" in n and not n.startswith("agent:")}
+    typed = collections.Counter()
+    for h in dg["history"]:
+        m = re.match(r"/([\w:.-]*\w)(?=\s|$)", h["display"])  # not a path or "/foo."
+        if m:
+            typed[m.group(1)] += 1
+    for d in dg["sessions"]:
+        if "agentId" not in d:
+            for n in d["slash"]:
+                typed.setdefault(n, 1)
+    return {n: c for n, c in sorted(typed.items()) if n not in known}
+
+
 def agent_c_input(dg):
     """Agent C's slice: the Toolkit table and the prompts to match against it. Never split."""
     prompts = [{"session": d["file"], "project": d.get("cwd"), "prompts": [t["prompt"] for t in d["turns"]]}
                for d in dg["sessions"] if "agentId" not in d and d["turns"]]
-    return {**build_toolkit(dg), "sessions": prompts}
+    tk = build_toolkit(dg)
+    return {**tk, "dead_slash": dead_slash(dg, tk["items"]), "sessions": prompts}
 
 
 def _json_default(o):
