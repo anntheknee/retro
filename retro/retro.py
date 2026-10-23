@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Helper for the /retro skill. Claude runs these subcommands; the user never does."""
-import collections, glob, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile
+import collections, glob, html, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -956,6 +956,58 @@ def usage_line():
         return "Plan usage: unavailable"
 
 
+INSIGHTS_SECTIONS = ["section-friction", "section-features", "section-patterns", "section-horizon"]
+
+
+def start_insights(tmp):
+    # detached so it outlives prepare; `insights` waits for the done file
+    subprocess.Popen(["sh", "-c", 'claude -p "/insights" --output-format json > insights_run.json 2> insights_err.txt; echo $? > insights_done.tmp; mv insights_done.tmp insights_done'],
+                     cwd=tmp, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def insights(tmp, wait=300):
+    """Wait for the background /insights run, then write insights.json: date range and the four sections as text, or an error."""
+    tmp = Path(tmp)
+    out = tmp / "insights.json"
+    try:
+        for _ in range(wait):
+            if (tmp / "insights_done").exists():
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("timed out")
+        if (tmp / "insights_done").read_text().strip() != "0":
+            raise RuntimeError("claude exited with " + (tmp / "insights_done").read_text().strip() + ": " + (tmp / "insights_err.txt").read_text()[:200])
+        res = json.loads((tmp / "insights_run.json").read_text())
+        if res.get("is_error"):
+            raise RuntimeError(str(res.get("result"))[:200])
+        m = re.search(r"[^\s\"'`()]*report[^\s\"'`()]*\.html", str(res.get("result")))
+        report = Path(m.group(0).replace("file://", "")).expanduser() if m else None
+        if not (report and report.is_file()):  # the result didn't name it: take the newest report written since the run began
+            started = (tmp / "insights_run.json").stat().st_birthtime
+            fresh = [f for f in (HOME / "usage-data").glob("report*.html") if f.stat().st_mtime >= started]
+            report = max(fresh, key=lambda f: f.stat().st_mtime) if fresh else None
+        if report is None:
+            raise RuntimeError("no new report found")
+        page = report.read_text()
+        r = re.search(r'class="subtitle">[^<]*?(\d{4}-\d\d-\d\d) to (\d{4}-\d\d-\d\d)', page)
+        sections = {}
+        for sid in INSIGHTS_SECTIONS:
+            i = page.find(f'id="{sid}"')
+            if i < 0:
+                continue
+            j = page.find("<h2", i + 10)
+            body = re.sub(r"<(script|style|button)\b.*?</\1>", "", page[page.find('>', i) + 1:j if j > 0 else len(page)], flags=re.S)
+            sections[sid] = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body))).strip()
+        if not sections:
+            raise RuntimeError("report has none of the four sections")
+        data = {"report": str(report), "date_range": [r.group(1), r.group(2)] if r else None, "sections": sections}
+    except Exception as e:
+        data = {"error": str(e)}
+    out.write_text(json.dumps(data, separators=(",", ":")))
+    print(out)
+
+
 def prepare(redo):
     hint = statusline_hint()
     start = now()
@@ -972,6 +1024,7 @@ def prepare(redo):
             return
     dg = build_digest(start)
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
+    start_insights(tmp)
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
     prev = previous_findings(redo)
@@ -1020,7 +1073,9 @@ if __name__ == "__main__":
         status()
     elif cmd == "context" and len(args) in (2, 3):
         context(*args)
+    elif cmd == "insights" and args:
+        insights(args[0])
     elif cmd == "commit" and args:
         commit(args[0])
     else:
-        sys.exit("usage: retro.py prepare [--redo] | context <session> <turn> [<temp folder>] | commit <draft.md> | status")
+        sys.exit("usage: retro.py prepare [--redo] | context <session> <turn> [<temp folder>] | insights <temp folder> | commit <draft.md> | status")
