@@ -18,6 +18,11 @@ ERROR_LOOP = 3  # tool errors in one turn that count as an error-and-retry loop
 LONG_TURNS = 30  # a Session with this many typed prompts counts as long
 CACHE_WRITE_HEAVY = 50_000  # cache-write tokens in one turn
 CLAUDE_MD_LINES = 200
+LONG_PROMPT = 200  # chars: a typed prompt this long may be a pasted playbook
+SIMILAR = 0.6  # word-trigram Jaccard at or above this counts as near-identical
+RECUR_SESSIONS = 3  # Bash heads and tool sequences must recur across this many Sessions
+SEQ_LEN = 3  # tools in a recurring sequence
+SEQ_MAX = 2000  # tool calls kept per Session for sequence counting
 # Record types the digest knows about or deliberately drops; anything else counts as format drift.
 KNOWN_TYPES = {
     "assistant", "attachment", "user", "api-request-blob", "mode", "atis-latch", "last-prompt",
@@ -121,7 +126,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
          "perm_modes": collections.Counter(), "denied": collections.Counter(),
          "prompted_by": collections.Counter(), "tokens_by_model": collections.defaultdict(collections.Counter),
          "tokens_by_effort": collections.defaultdict(collections.Counter), "cache_heavy": [],
-         "ctx_sum": 0, "first_ctx": 0}
+         "ctx_sum": 0, "first_ctx": 0, "tool_seq": [], "agent_prompts": []}
     tool_by_uuid = {}
     listing = None
     reqs, cur, first, last, cut, drift, seen_user = {}, None, None, None, None, 0, False
@@ -194,6 +199,10 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
                                 head = " ".join(cmd[:2]) if cmd[0] in ("git", "gh", "npm", "uv", "claude", "openspec") else cmd[0]
                                 d["bash_heads"][head] += 1
                         tool_by_uuid[r.get("uuid")] = tool_by_uuid[c.get("id")] = f"{n} {head}".strip()
+                        if len(d["tool_seq"]) < SEQ_MAX:
+                            d["tool_seq"].append(tool_by_uuid[c.get("id")])
+                        if n in ("Agent", "Task") and inp.get("prompt"):
+                            d["agent_prompts"].append(str(inp["prompt"])[:PROMPT_MAX])
             elif t == "user":
                 c = (r.get("message") or {}).get("content")
                 tids = [x.get("tool_use_id") for x in c if isinstance(x, dict)] if isinstance(c, list) else []
@@ -472,6 +481,63 @@ def agent_a_input(dg):
                          for d in dg["sessions"] if "agentId" not in d and d["turns"]]}
 
 
+def norm(s):
+    return " ".join(re.findall(r"\w+", s.lower()))
+
+
+def shingles(s):
+    w = norm(s).split()
+    return {" ".join(w[i:i + 3]) for i in range(max(len(w) - 2, 1))}
+
+
+def clusters(items):
+    """Group (where, text) items whose word trigrams overlap >= SIMILAR; keep groups spanning 2+ places."""
+    groups = []  # ponytail: greedy single pass, O(n*groups); a different order can split a group
+    for where, text in items:
+        sh = shingles(text)
+        if not norm(text):
+            continue
+        for g in groups:
+            if len(sh & g["sh"]) / len(sh | g["sh"]) >= SIMILAR:
+                g["where"].append(where)
+                break
+        else:
+            groups.append({"sh": sh, "text": text, "where": [where]})
+    out = [{"text": g["text"][:PROMPT_MAX], "count": len(set(g["where"])), "where": sorted(set(g["where"]))[:10]}
+           for g in groups if len(set(g["where"])) >= 2]
+    return sorted(out, key=lambda g: -g["count"])[:15]
+
+
+def agent_b_input(dg):
+    """Agent B's slice: typed prompts plus whole-Window repeat candidates for categories 4 and 8."""
+    mains = [d for d in dg["sessions"] if "agentId" not in d and d["turns"]]
+    prompts = [(d["file"], t["prompt"]) for d in mains for t in d["turns"]]
+    exact = collections.defaultdict(set)
+    for f, p in prompts:
+        if len(norm(p)) >= 15:
+            exact[norm(p)].add(f)
+    heads = collections.defaultdict(set)
+    seqs = collections.defaultdict(set)
+    for d in mains:
+        for h in d["bash_heads"]:
+            heads[h].add(d["file"])
+        q = d["tool_seq"]
+        for i in range(len(q) - SEQ_LEN + 1):
+            if len(set(q[i:i + SEQ_LEN])) > 1:
+                seqs[" > ".join(q[i:i + SEQ_LEN])].add(d["file"])
+    recur = lambda m: sorted(((k, len(v)) for k, v in m.items() if len(v) >= RECUR_SESSIONS), key=lambda x: -x[1])[:20]
+    return {
+        "repeated_prompts": sorted(({"prompt": k[:PROMPT_MAX], "sessions": len(v), "where": sorted(v)[:10]}
+                                    for k, v in exact.items() if len(v) >= 2), key=lambda x: -x["sessions"])[:20],
+        "long_prompt_duplicates": clusters([(f, p) for f, p in prompts if len(p) >= LONG_PROMPT]),
+        "similar_openings": clusters([(d["file"], d["turns"][0]["prompt"]) for d in mains if len(d["turns"][0]["prompt"]) >= 15]),
+        "similar_agent_prompts": clusters([(d["file"], p) for d in dg["sessions"] for p in d["agent_prompts"]]),
+        "bash_heads_in_3plus_sessions": recur(heads),
+        "tool_sequences_in_3plus_sessions": recur(seqs),
+        "sessions": [{"session": d["file"], "project": d.get("cwd"), "prompts": [t["prompt"] for t in d["turns"]]} for d in mains],
+    }
+
+
 def _json_default(o):
     return dict(o) if isinstance(o, collections.Counter) else list(o)
 
@@ -504,6 +570,7 @@ def prepare(redo):
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
     (tmp / "agent_a.json").write_text(json.dumps(agent_a_input(dg), default=_json_default, separators=(",", ":")))
+    (tmp / "agent_b.json").write_text(json.dumps(agent_b_input(dg), default=_json_default, separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
