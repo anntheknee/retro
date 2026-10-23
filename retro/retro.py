@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Helper for the /retro skill. Claude runs these subcommands; the user never does."""
-import json, math, os, re, subprocess, sys, tempfile
+import json, math, re, shutil, subprocess, sys, tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,9 +40,12 @@ def last_retro_start():
     """Start of the gate period: the Retro Timestamp, else the oldest history entry."""
     if FINDINGS.exists():
         return findings_timestamp(FINDINGS)
-    with HISTORY.open() as f:
-        first = json.loads(f.readline())
-    return datetime.fromtimestamp(first["timestamp"] / 1000, timezone.utc)
+    try:
+        with HISTORY.open() as f:
+            first = json.loads(f.readline())
+        return datetime.fromtimestamp(first["timestamp"] / 1000, timezone.utc)
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def usage_line():
@@ -57,7 +60,11 @@ def usage_line():
 def prepare(redo):
     start = now()
     if not redo:
-        left = last_retro_start() + timedelta(days=GATE_DAYS) - start
+        began = last_retro_start()
+        if began is None:
+            print("No usable history.jsonl yet, so no Retro is possible.")
+            return
+        left = began + timedelta(days=GATE_DAYS) - start
         if left > timedelta(0):
             print(f"Too soon for a Retro: {math.ceil(left / timedelta(days=1))} days left.")
             return
@@ -73,14 +80,13 @@ def commit(draft):
     tmp = draft.parent
     state = json.loads((tmp / "state.json").read_text())
     STATE.mkdir(parents=True, exist_ok=True)
-    if not state["redo"] and FINDINGS.exists():
-        FINDINGS.replace(PREV)
     new = FINDINGS.with_suffix(".md.tmp")
     new.write_text(f"---\nretro_timestamp: {state['timestamp']}\n---\n\n{draft.read_text()}")
+    if not state["redo"] and FINDINGS.exists():
+        FINDINGS.replace(PREV)
     new.replace(FINDINGS)
-    for p in tmp.iterdir():
-        p.unlink()
-    tmp.rmdir()
+    if tmp.name.startswith("retro-"):
+        shutil.rmtree(tmp)
     print(FINDINGS)
     subprocess.run(["open", str(FINDINGS)])
 
