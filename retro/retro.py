@@ -25,6 +25,7 @@ SEQ_LEN = 3  # tools in a recurring sequence
 DESC_MAX = 300  # chars of a Toolkit description kept for agent C
 PATCH_MAX = 1500  # chars of one upstream file diff kept for the port-this judgment
 PATCH_FILES = 8  # changed files per tracked source that carry a diff
+SPLIT_TOKENS = 100_000  # an agent input over this (bytes / 4) is split into whole-Session pieces
 SEQ_MAX = 2000  # tool calls kept per Session for sequence counting
 # Record types the digest knows about or deliberately drops; anything else counts as format drift.
 KNOWN_TYPES = {
@@ -1161,6 +1162,29 @@ def news(tmp, categories=()):
     print(tmp / "news.json", len(out["items"]), "items")
 
 
+def split_input(inp, cap=None):
+    """Cut an agent input into ceil(tokens / cap) pieces of whole Sessions in time order. B's whole-Window lists go to every piece; only the first keeps previous_findings."""
+    cap = cap or SPLIT_TOKENS
+    size = lambda o: len(json.dumps(o, default=_json_default, separators=(",", ":"))) / 4
+    if size(inp) <= cap:
+        return [inp]
+    ss = inp["sessions"]
+    fixed = size({k: v for k, v in inp.items() if k != "sessions"})  # B's lists ride along in every piece
+    n = math.ceil(sum(size(x) for x in ss) / (cap - fixed if cap > fixed else cap))
+    per = sum(size(x) for x in ss) / n
+    pieces, cur, acc = [], [], 0
+    for x in ss:
+        if cur and acc >= per and len(pieces) < n - 1:
+            pieces.append(cur)
+            cur, acc = [], 0
+        cur.append(x)
+        acc += size(x)
+    pieces.append(cur)
+    rest = {k: v for k, v in inp.items() if k not in ("sessions", "previous_findings")}
+    return [{**rest, **({"previous_findings": inp["previous_findings"]} if i == 0 and "previous_findings" in inp else {}), "sessions": ps}
+            for i, ps in enumerate(pieces)]
+
+
 def prepare(redo):
     hint = statusline_hint()
     start = now()
@@ -1181,11 +1205,20 @@ def prepare(redo):
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
     prev = previous_findings(redo)
+    splits = {}
     for a, fn in (("a", agent_a_input), ("b", agent_b_input), ("c", agent_c_input)):
         inp = fn(dg)
         if prev is not None:
             inp["previous_findings"] = prev[a]
-        (tmp / f"agent_{a}.json").write_text(json.dumps(inp, default=_json_default, separators=(",", ":")))
+        pieces = split_input(inp) if a != "c" else [inp]  # C is never split
+        if len(pieces) > 1:
+            names = [f"agent_{a}_{i + 1}.json" for i in range(len(pieces))]
+            splits[a] = names
+            for nm, pc in zip(names, pieces):
+                (tmp / nm).write_text(json.dumps(pc, default=_json_default, separators=(",", ":")))
+        else:
+            (tmp / f"agent_{a}.json").write_text(json.dumps(inp, default=_json_default, separators=(",", ":")))
+    (tmp / "splits.json").write_text(json.dumps(splits))
     (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
     up = build_upstream(dg, cursor(redo, start))
     (tmp / "upstream.json").write_text(json.dumps(up, separators=(",", ":")))
@@ -1193,6 +1226,8 @@ def prepare(redo):
     (tmp / "news_raw.json").write_text(json.dumps(fetch_news(cursor(redo, start)), separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
+    for a, names in splits.items():
+        print(f"agent {a.upper()} input split into {len(names)} pieces: see splits.json")
     print(f"format drift: {dg['drift']} records skipped")
     print(usage_line())
     if hint:
