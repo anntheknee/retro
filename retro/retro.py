@@ -22,6 +22,7 @@ LONG_PROMPT = 200  # chars: a typed prompt this long may be a pasted playbook
 SIMILAR = 0.6  # word-trigram Jaccard at or above this counts as near-identical
 RECUR_SESSIONS = 3  # Bash heads and tool sequences must recur across this many Sessions
 SEQ_LEN = 3  # tools in a recurring sequence
+DESC_MAX = 300  # chars of a Toolkit description kept for agent C
 SEQ_MAX = 2000  # tool calls kept per Session for sequence counting
 # Record types the digest knows about or deliberately drops; anything else counts as format drift.
 KNOWN_TYPES = {
@@ -30,6 +31,10 @@ KNOWN_TYPES = {
     "queue-operation", "file-history-delta", "cost-state", "api-request-shape", "agent-color",
     "pr-link", "custom-title",
 }
+
+# Built-in slash commands users type; not on disk, so listed here. Bundled skills come from the skill listing.
+BUILTIN_COMMANDS = ["clear", "compact", "context", "cost", "doctor", "help", "init", "insights", "model", "rewind",
+                    "resume", "review", "usage", "config", "memory", "permissions", "plan", "btw", "rename"]
 
 SKELETON = """Sessions: {sessions} · Projects: {projects} · Findings: 0
 
@@ -538,6 +543,116 @@ def agent_b_input(dg):
     }
 
 
+def frontmatter(path):
+    """Top-level `key: value` pairs of a SKILL.md or agent file; folded `>`/`|` values are joined."""
+    try:
+        head = re.match(r"\s*---\n(.*?)\n---", path.read_text(errors="replace"), re.S).group(1).splitlines()
+    except (OSError, AttributeError):
+        return {}
+    out, key, folded = {}, None, False
+    for line in head:
+        m = re.match(r"^([\w-]+):\s*(.*)$", line)
+        if m:
+            key = m.group(1)
+            folded = m.group(2).strip() in (">", "|", ">-", "|-")
+            out[key] = "" if folded else m.group(2).strip().strip("\"'")
+        elif folded and line.startswith((" ", "\t")):
+            out[key] = (out[key] + " " + line.strip()).strip()
+    return out
+
+
+def load_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def build_toolkit(dg):
+    """One row per invocable item, plus the plugin list. Tolerates missing or changed layouts."""
+    claude_json = load_json(HOME.parent / ".claude.json")
+    lifetime = lambda n: (claude_json.get("skillUsage", {}).get(n) or {}).get("usageCount")
+    lock = load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
+    uses, tool_uses = collections.Counter(), collections.Counter()
+    for d in dg["sessions"]:
+        uses.update(d["skills_invoked"])
+        uses.update(d["slash"])
+        tool_uses.update(d["tools"])
+        if d.get("agent", {}).get("agentType"):
+            uses["agent:" + d["agent"]["agentType"]] += 1
+    rows = {}
+
+    def add(name, origin, auto, desc):
+        rows.setdefault(name, {"name": name, "origin": origin, "auto": auto, "description": (desc or "")[:DESC_MAX],
+                               "uses": uses.get(name, 0), "lifetime": lifetime(name)})
+
+    def add_skill(f, name, origin):
+        fm = frontmatter(f)
+        add(name or fm.get("name") or f.parent.name, origin, fm.get("disable-model-invocation") != "true", fm.get("description"))
+
+    for f in sorted((HOME / "skills").glob("*/SKILL.md")):
+        d = f.parent
+        if d.name == "synced":
+            continue
+        if d.is_symlink():
+            src = (lock.get(d.resolve().name) or {}).get("source")
+            add_skill(f, frontmatter(f).get("name") or d.name, f"skills CLI ({src or 'unlocked symlink'})")
+        else:
+            add_skill(f, frontmatter(f).get("name") or d.name, "hand copy")
+    for m in (HOME / "skills" / "synced").glob("*/manifest.json"):
+        for sk in load_json(m).get("skills", []):
+            if sk.get("name"):
+                add("anthropic-skills:" + sk["name"], f"claude.ai synced ({sk.get('source')})", True, sk.get("description"))
+    for cwd in sorted({d["cwd"] for d in dg["sessions"] if d.get("cwd") and "agentId" not in d}):
+        proj = Path(cwd) / ".claude"
+        if proj == HOME:
+            continue
+        for f in sorted(proj.glob("skills/*/SKILL.md")):
+            add_skill(f, None, f"project {Path(cwd).name}")
+        for f in sorted(proj.glob("commands/**/*.md")):
+            add(":".join(f.relative_to(proj / "commands").with_suffix("").parts), f"project {Path(cwd).name}", False, frontmatter(f).get("description"))
+        for f in sorted(proj.glob("agents/*.md")):
+            add("agent:" + (frontmatter(f).get("name") or f.stem), f"project {Path(cwd).name}", True, frontmatter(f).get("description"))
+    for f in sorted((HOME / "commands").glob("**/*.md")):
+        add(":".join(f.relative_to(HOME / "commands").with_suffix("").parts), "user command", False, frontmatter(f).get("description"))
+    for f in sorted((HOME / "agents").glob("*.md")):
+        add("agent:" + (frontmatter(f).get("name") or f.stem), "user agent", True, frontmatter(f).get("description"))
+    plugins = []
+    for pid, installs in (load_json(HOME / "plugins" / "installed_plugins.json").get("plugins") or {}).items():
+        inst = installs[0] if isinstance(installs, list) and installs and isinstance(installs[0], dict) else {}
+        pname, root = pid.split("@")[0], Path(inst.get("installPath", "/nonexistent"))
+        names = []
+        for f in sorted(root.glob("skills/*/SKILL.md")):
+            n = f"{pname}:{frontmatter(f).get('name') or f.parent.name}"
+            add_skill(f, n, f"plugin {pid}")
+            names.append(n)
+        for f in sorted(root.glob("commands/**/*.md")):
+            n = f"{pname}:{f.stem}"
+            add(n, f"plugin {pid}", False, frontmatter(f).get("description"))
+            names.append(n)
+        for f in sorted(root.glob("agents/*.md")):
+            n = f"agent:{pname}:" + (frontmatter(f).get("name") or f.stem)
+            add(n, f"plugin {pid}", True, frontmatter(f).get("description"))
+            names.append(n)
+        mcp = sum(c for t, c in tool_uses.items() if t.startswith(f"mcp__plugin_{pname}_"))
+        used = sum(uses.get(n, 0) for n in names) + mcp
+        has_hooks = (root / "hooks").exists()
+        status = "used" if used else (("hooks only, can't tell" if not names else "unused, but ships hooks") if has_hooks else "unused")
+        plugins.append({"plugin": pid, "version": inst.get("version"), "items": names, "uses": used, "status": status})
+    for n in dg["skill_listings"]:
+        add(n, "bundled or built-in (skill listing)", True, None)
+    for n in BUILTIN_COMMANDS:
+        add(n, "built-in command", False, None)
+    return {"items": sorted(rows.values(), key=lambda r: r["name"]), "plugins": plugins}
+
+
+def agent_c_input(dg):
+    """Agent C's slice: the Toolkit table and the prompts to match against it. Never split."""
+    prompts = [{"session": d["file"], "project": d.get("cwd"), "prompts": [t["prompt"] for t in d["turns"]]}
+               for d in dg["sessions"] if "agentId" not in d and d["turns"]]
+    return {**build_toolkit(dg), "sessions": prompts}
+
+
 def _json_default(o):
     return dict(o) if isinstance(o, collections.Counter) else list(o)
 
@@ -571,6 +686,7 @@ def prepare(redo):
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
     (tmp / "agent_a.json").write_text(json.dumps(agent_a_input(dg), default=_json_default, separators=(",", ":")))
     (tmp / "agent_b.json").write_text(json.dumps(agent_b_input(dg), default=_json_default, separators=(",", ":")))
+    (tmp / "agent_c.json").write_text(json.dumps(agent_c_input(dg), default=_json_default, separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
