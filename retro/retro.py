@@ -694,6 +694,125 @@ def previous_findings(redo):
     return out
 
 
+def cursor(redo, start):
+    """Start of the changelog scope: the previous Retro's Timestamp (a Redo: the one in the previous file), else 30 days back."""
+    path = PREV if redo else FINDINGS
+    try:
+        return iso(findings_timestamp(path))
+    except (OSError, IndexError, AttributeError, ValueError):
+        return iso(start - timedelta(days=GATE_DAYS))
+
+
+def run_json(cmd):
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if out.returncode:
+        raise RuntimeError((out.stderr or "failed").strip()[:200])
+    return json.loads(out.stdout)
+
+
+def gh(path):
+    return run_json(["gh", "api", path])
+
+
+def vkey(v):
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.+-]", v.lstrip("v")))
+
+
+def build_upstream(dg, since, tk=None):
+    """What is behind upstream, as plain data for the main session. Each part tolerates a failed call."""
+    tk = tk or build_toolkit(dg)
+    uses = {r["name"]: r["uses"] for r in tk["items"]}
+    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "errors": []}
+
+    def attempt(what, fn):
+        try:
+            return fn()
+        except Exception as e:  # missing gh, no network, changed layout
+            out["errors"].append(f"{what}: {e}")
+
+    lock = load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
+    names = {}  # lock key -> the name the Toolkit table uses
+    for f in (HOME / "skills").glob("*/SKILL.md"):
+        if f.parent.is_symlink():
+            names[f.parent.resolve().name] = frontmatter(f).get("name") or f.parent.name
+    repos = collections.defaultdict(dict)
+    for key, sk in lock.items():
+        if sk.get("sourceType") == "github" and "/" in (sk.get("skillPath") or ""):  # a repo-root skill has no tree entry
+            repos[sk["source"]][key] = sk
+    for repo, group in repos.items():
+        def check(repo=repo, group=group):
+            full = gh(f"repos/{repo}/git/trees/HEAD?recursive=1")
+            if full.get("truncated"):
+                raise RuntimeError("tree too large, skipped")
+            tree = {t["path"]: t["sha"] for t in full["tree"] if t["type"] == "tree"}
+            commits = None
+            for key, sk in group.items():
+                d = sk["skillPath"].rsplit("/", 1)[0]
+                state = "removed upstream" if d not in tree else ("behind" if tree[d] != sk["skillFolderHash"] else None)
+                if state:
+                    if commits is None:
+                        commits = [c["commit"]["message"].split("\n")[0] for c in gh(f"repos/{repo}/commits?since={since}&per_page=100")]
+                    out["skills"].append({"name": names.get(key, key), "lock_key": key, "repo": repo, "path": d, "state": state,
+                                          "uses": uses.get(names.get(key, key), 0), "update": "npx skills update " + key})
+            if commits is not None:
+                out["commits"][repo] = commits
+        attempt(f"skills {repo}", check)
+    def synced():
+        for m in (HOME / "skills" / "synced").glob("*/manifest.json"):
+            for sk in load_json(m).get("skills", []):
+                n = "anthropic-skills:" + sk.get("name", "?")
+                if isinstance(sk.get("updatedAt"), str) and sk["updatedAt"] > since:
+                    out["synced"].append({"name": n, "updated": sk["updatedAt"], "uses": uses.get(n, 0)})
+    attempt("synced skills", synced)
+    markets = load_json(HOME / "plugins" / "known_marketplaces.json")
+    for pid, installs in (load_json(HOME / "plugins" / "installed_plugins.json").get("plugins") or {}).items():
+        inst = installs[0] if isinstance(installs, list) and installs and isinstance(installs[0], dict) else {}
+        pname, _, market = pid.partition("@")
+        repo = ((markets.get(market) or {}).get("source") or {}).get("repo") if isinstance(markets.get(market), dict) else None
+        if not isinstance(repo, str):
+            continue
+
+        def check(pid=pid, pname=pname, repo=repo, inst=inst):
+            row = {"plugin": pid, "installed": inst.get("version") or (inst.get("gitCommitSha") or "")[:12],
+                   "uses": next((p["uses"] for p in tk["plugins"] if p["plugin"] == pid), 0), "update": f"claude plugin update {pid}"}
+            latest = None
+            try:  # a pinned version wins; else compare commits
+                mk = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/contents/.claude-plugin/marketplace.json", "-H",
+                                                "Accept: application/vnd.github.raw"], capture_output=True, text=True, timeout=60).stdout)
+                latest = next((p.get("version") for p in mk.get("plugins", []) if p.get("name") == pname), None)
+            except ValueError:
+                pass
+            if not latest:
+                try:
+                    latest = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/contents/.claude-plugin/plugin.json", "-H",
+                                                        "Accept: application/vnd.github.raw"], capture_output=True, text=True, timeout=60).stdout).get("version")
+                except ValueError:
+                    pass
+            if latest and inst.get("version"):
+                behind = vkey(latest) > vkey(inst["version"])
+            else:
+                latest = gh(f"repos/{repo}/commits/HEAD")["sha"][:12]
+                behind = bool(inst.get("gitCommitSha")) and not latest.startswith(inst["gitCommitSha"][:12])
+            if behind:
+                row["latest"] = latest
+                row["releases_since_cursor"] = [{"tag": r["tag_name"], "published": r["published_at"], "notes": (r.get("body") or "")[:500]}
+                                                for r in gh(f"repos/{repo}/releases?per_page=30") if (r.get("published_at") or "") > since]
+                out["plugins"].append(row)
+        attempt(f"plugin {pid}", check)
+
+    def claude_code():
+        installed = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30).stdout.split()[0]
+        times = run_json(["npm", "view", "@anthropic-ai/claude-code", "time", "--json"])
+        vs = {v: t for v, t in times.items() if re.fullmatch(r"\d+\.\d+\.\d+", v)}
+        latest = max(vs, key=vkey)
+        if vkey(latest) > vkey(installed):
+            out["claude_code"] = {"installed": installed, "latest": latest, "update": "claude update",
+                                  "releases_since_cursor": sorted((v for v, t in vs.items() if t > since), key=vkey)[-60:],
+                                  "upstream_of": "built-in commands, bundled skills and agents"}
+    attempt("claude code", claude_code)
+    return out
+
+
 def _json_default(o):
     return dict(o) if isinstance(o, collections.Counter) else list(o)
 
@@ -732,6 +851,7 @@ def prepare(redo):
             inp["previous_findings"] = prev[a]
         (tmp / f"agent_{a}.json").write_text(json.dumps(inp, default=_json_default, separators=(",", ":")))
     (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
+    (tmp / "upstream.json").write_text(json.dumps(build_upstream(dg, cursor(redo, start)), separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
