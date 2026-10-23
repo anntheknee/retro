@@ -674,6 +674,26 @@ def agent_c_input(dg):
     return {**tk, "dead_slash": dead_slash(dg, tk["items"]), "sessions": prompts}
 
 
+AGENT_CATEGORIES = {"a": {"prompting", "rework"}, "b": {"repeats", "workflows"}, "c": {"skills", "overlap"}}
+
+
+def previous_findings(redo):
+    """The baseline Findings by owner (agent a/b/c, else main), plus its Toolkit updates and Meta text.
+    Baseline: the current findings file, or the previous-findings file on a Redo. None: no previous Retro."""
+    path = PREV if redo else FINDINGS
+    if not path.exists():
+        return None
+    body = re.sub(r"\A---\n.*?\n---\n", "", path.read_text(), flags=re.S)
+    sections = {m.group(1): m.group(2) for m in re.finditer(r"^## (.+?)\n(.*?)(?=^## |\Z)", body, re.M | re.S)}
+    out = {o: [] for o in ("a", "b", "c", "main")}
+    for m in re.finditer(r"^(### \d+\. ([^\n·]+?)(?: ·[^\n]*)?)\n(.*?)(?=^### |\Z)", sections.get("Findings", ""), re.M | re.S):
+        owner = next((a for a, cats in AGENT_CATEGORIES.items() if m.group(2).strip().lower() in cats), "main")
+        out[owner].append(m.group(1) + "\n" + m.group(3).strip())
+    out["toolkit_updates"] = sections.get("Toolkit updates", "").strip()
+    out["meta"] = sections.get("Meta", "").strip()
+    return out
+
+
 def _json_default(o):
     return dict(o) if isinstance(o, collections.Counter) else list(o)
 
@@ -705,9 +725,13 @@ def prepare(redo):
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
-    (tmp / "agent_a.json").write_text(json.dumps(agent_a_input(dg), default=_json_default, separators=(",", ":")))
-    (tmp / "agent_b.json").write_text(json.dumps(agent_b_input(dg), default=_json_default, separators=(",", ":")))
-    (tmp / "agent_c.json").write_text(json.dumps(agent_c_input(dg), default=_json_default, separators=(",", ":")))
+    prev = previous_findings(redo)
+    for a, fn in (("a", agent_a_input), ("b", agent_b_input), ("c", agent_c_input)):
+        inp = fn(dg)
+        if prev is not None:
+            inp["previous_findings"] = prev[a]
+        (tmp / f"agent_{a}.json").write_text(json.dumps(inp, default=_json_default, separators=(",", ":")))
+    (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
