@@ -48,6 +48,38 @@ def last_retro_start():
         return None
 
 
+def status():
+    if not FINDINGS.exists():
+        print("retro due")
+        return
+    days = (now() - findings_timestamp(FINDINGS)).days
+    if days == GATE_DAYS:
+        print("retro due")
+    elif days > GATE_DAYS:
+        lost = days - GATE_DAYS
+        color = "38;5;208" if lost < 7 else "31"
+        print(f"\033[{color}mretro overdue · {lost}d lost\033[0m")
+
+
+def statusline_hint():
+    """Return a hint when the user's statusLine doesn't call `retro.py status`, else None."""
+    try:
+        cmd = json.loads((HOME / "settings.json").read_text())["statusLine"]["command"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "Statusline hint: no statusLine set; offer to set it to the `retro.py status` call."
+    text = cmd
+    for word in cmd.split():
+        try:
+            f = Path(word).expanduser()
+            if f.is_file():
+                text += f.read_text()
+        except (OSError, ValueError, RuntimeError):
+            pass  # unreadable word in the command: judge by what we have
+    if "retro.py status" in text:
+        return None
+    return f"Statusline hint: statusLine ({cmd}) has no `retro.py status` call; offer to add it."
+
+
 def usage_line():
     try:
         out = subprocess.run(["claude", "-p", "/usage"], capture_output=True, text=True, timeout=60).stdout
@@ -58,6 +90,7 @@ def usage_line():
 
 
 def prepare(redo):
+    hint = statusline_hint()
     start = now()
     if not redo:
         began = last_retro_start()
@@ -67,11 +100,15 @@ def prepare(redo):
         left = began + timedelta(days=GATE_DAYS) - start
         if left > timedelta(0):
             print(f"Too soon for a Retro: {math.ceil(left / timedelta(days=1))} days left.")
+            if hint:
+                print(hint)
             return
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "draft.md").write_text(SKELETON)
     print(usage_line())
+    if hint:
+        print(hint)
     print(f"Temp folder: {tmp}")
 
 
@@ -95,7 +132,9 @@ if __name__ == "__main__":
     cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
     if cmd == "prepare":
         prepare("--redo" in args)
+    elif cmd == "status":
+        status()
     elif cmd == "commit" and args:
         commit(args[0])
     else:
-        sys.exit("usage: retro.py prepare [--redo] | commit <draft.md>")
+        sys.exit("usage: retro.py prepare [--redo] | commit <draft.md> | status")
