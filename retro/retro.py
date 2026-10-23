@@ -12,6 +12,9 @@ PREV = STATE / "findings.prev.md"
 HISTORY = HOME / "history.jsonl"
 PROJECTS = HOME / "projects"
 PROMPT_MAX = 300
+TAIL_MAX = 300  # tail of the previous reply kept on a flagged turn
+CHURN_EDITS = 3  # edits to one file in one turn that count as churn
+ERROR_LOOP = 3  # tool errors in one turn that count as an error-and-retry loop
 LONG_TURNS = 30  # a Session with this many typed prompts counts as long
 CACHE_WRITE_HEAVY = 50_000  # cache-write tokens in one turn
 CLAUDE_MD_LINES = 200
@@ -102,11 +105,12 @@ def text_of(c):
     return " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
 
 
-def digest_session(path, lo, hi, parent_cut=None):
+def digest_session(path, lo, hi, parent_cut=None, full=False):
     """Digest one transcript, keeping only records in [lo, hi). Returns (digest, own_cut, drift).
 
     A typed `/retro` cuts the Session from that prompt onward; a subagent is cut at its parent's cut.
     Returns digest None for a headless Session the Retro itself started.
+    `full` keeps whole prompts, longer tails and error texts on every turn, for `context`.
     """
     d = {"file": str(path.relative_to(PROJECTS)), "versions": set(), "models": collections.Counter(),
          "effort": collections.Counter(), "tokens": collections.Counter(), "peak_ctx": 0,
@@ -121,6 +125,7 @@ def digest_session(path, lo, hi, parent_cut=None):
     tool_by_uuid = {}
     listing = None
     reqs, cur, first, last, cut, drift, seen_user = {}, None, None, None, None, 0, False
+    reply = ""  # tail of the latest assistant text
     cutoff = parent_cut or "￿"
     try:
         lines = path.open(errors="replace").readlines()
@@ -158,8 +163,15 @@ def digest_session(path, lo, hi, parent_cut=None):
                 d["perm_modes"][r.get("permissionMode")] += 1
             elif t == "cost-state":
                 d["cost_usd"] = max(d.get("cost_usd", 0), r.get("totalCostUSD") or 0)
+            elif t == "queue-operation":
+                if r.get("reason") == "absorbed_mid_turn" and cur:
+                    cur["steered"] = cur.get("steered", 0) + 1
+                    cur.setdefault("steering", []).append((r.get("content") or "")[:PROMPT_MAX])
             elif t == "assistant":
                 m = r.get("message") or {}
+                txt = text_of(m.get("content") or []).strip()
+                if txt:
+                    reply = txt[-(10 * TAIL_MAX if full else TAIL_MAX):]
                 reqs[r.get("requestId") or r.get("uuid")] = (m.get("model"), m.get("usage") or {}, r.get("attributionSkill"), str(r.get("effort")), cur)
                 d["effort"][str(r.get("effort"))] += 1
                 if r.get("isApiErrorMessage"):
@@ -171,6 +183,8 @@ def digest_session(path, lo, hi, parent_cut=None):
                         if cur:
                             cur["tools"][n] += 1
                         inp = c.get("input") or {}
+                        if cur and n in ("Edit", "Write", "MultiEdit", "NotebookEdit") and inp.get("file_path"):
+                            cur["edits"][inp["file_path"]] += 1
                         head = ""
                         if n == "Skill":
                             d["skills_invoked"][inp.get("skill")] += 1
@@ -198,7 +212,10 @@ def digest_session(path, lo, hi, parent_cut=None):
                     for x in c:
                         if isinstance(x, dict) and x.get("type") == "tool_result" and x.get("is_error"):
                             cc = x.get("content")
-                            d["tool_errors"].append((cc if isinstance(cc, str) else json.dumps(cc))[:80])
+                            msg = cc if isinstance(cc, str) else json.dumps(cc)
+                            d["tool_errors"].append(msg[:80])
+                            if cur:
+                                cur["errors"].append(msg[:500 if full else 80])
                 s = text_of(c) if c else ""
                 if s.startswith("[Request interrupted"):
                     d["interrupts"] += 1
@@ -218,7 +235,8 @@ def digest_session(path, lo, hi, parent_cut=None):
                     continue
                 if not s or s.startswith("<"):
                     continue
-                cur = {"ts": ts, "len": len(s), "prompt": s[:PROMPT_MAX], "tools": collections.Counter()}
+                cur = {"ts": ts, "len": len(s), "prompt": s if full else s[:PROMPT_MAX], "tools": collections.Counter(),
+                       "edits": collections.Counter(), "errors": [], "prev_tail": reply}
                 d["turns"].append(cur)
             elif t == "system":
                 st = r.get("subtype")
@@ -253,6 +271,22 @@ def digest_session(path, lo, hi, parent_cut=None):
         if sk:
             d["attrib_skill_out"][sk] += tok["out"]
     for t in d["turns"]:
+        edits, errors = t.pop("edits"), t.pop("errors")
+        churn = {f: n for f, n in edits.items() if n >= CHURN_EDITS}
+        flags = [k for k, on in (("interrupted", t.get("interrupted")), ("steered", t.get("steered")),
+                                 ("edit_churn", churn), ("error_loop", len(errors) >= ERROR_LOOP)) if on]
+        if flags:
+            t["flags"] = flags
+            if churn:
+                t["churn"] = churn
+            if errors:
+                t["errors"] = errors[:5]
+        if full:
+            t["edits"], t["errors"] = edits, errors
+        elif not flags:
+            t.pop("prev_tail")
+        if not t.get("prev_tail"):
+            t.pop("prev_tail", None)
         cw = t.pop("_cw", 0)
         if cw >= CACHE_WRITE_HEAVY:
             d["cache_heavy"].append({"ts": t["ts"], "cache_write": cw, "prompt": t["prompt"][:80]})
@@ -355,6 +389,28 @@ def compute_metrics(dg):
     return {"context": context, "cost": cost, "permissions": permissions}
 
 
+def context(session, turn, tmp=None):
+    """Print one turn in full. `session` is a digest `file` path or a session id; `turn` indexes its turns.
+
+    Pass the Retro temp folder so turns are counted inside the same Window as `agent_a.json`.
+    """
+    stem = Path(session).stem
+    hits = glob.glob(str(PROJECTS / "**" / f"{stem}.jsonl"), recursive=True)
+    if not hits:
+        sys.exit(f"no transcript for session {session}")
+    win = json.loads((Path(tmp) / "digest.json").read_text())["window"] if tmp else {"start": "", "end": "￿"}
+    d, _, _ = digest_session(Path(hits[0]), win["start"], win["end"], full=True)
+    try:
+        t = d["turns"][int(turn)]
+    except (TypeError, IndexError, ValueError):
+        sys.exit(f"turn {turn} not found ({len(d['turns']) if d else 0} turns)")
+    print(f"session {d['file']} turn {turn} at {t['ts']}\nflags: {', '.join(t.get('flags', [])) or 'none'}")
+    print(f"\n## Typed prompt\n{t['prompt']}\n\n## End of Claude's previous reply\n{t.get('prev_tail') or '(none)'}")
+    print(f"\n## Tools\n{dict(t['tools']) or '(none)'}\nedits per file: {dict(t['edits']) or '(none)'}")
+    print("\n## Mid-turn steering\n" + ("\n".join(f"- {x}" for x in t.get("steering", [])) or "(none)"))
+    print("\n## Tool errors\n" + ("\n".join(f"- {x}" for x in t["errors"]) or "(none)"))
+
+
 def build_digest(start):
     """Digest every Session in the Window [start-30d, start). Returns the digest dict."""
     lo, hi = iso(start - timedelta(days=GATE_DAYS)), iso(start)
@@ -407,6 +463,15 @@ def build_digest(start):
             "n_sessions": len(mains_in), "n_projects": len({d.get("cwd") for d in mains_in})}
 
 
+def agent_a_input(dg):
+    """Agent A's slice: every main Session's turns, indexed for `retro.py context`."""
+    keep = ("i", "ts", "prompt", "len", "ms", "flags", "steering", "churn", "errors", "prev_tail")
+    return {"sessions": [{"session": d["file"], "project": d.get("cwd"), "title": d.get("title"),
+                          "interrupts": d["interrupts"], "slash": d["slash"],
+                          "turns": [{k: t[k] for k in keep if k in t} for t in (dict(t, i=i) for i, t in enumerate(d["turns"]))]}
+                         for d in dg["sessions"] if "agentId" not in d and d["turns"]]}
+
+
 def _json_default(o):
     return dict(o) if isinstance(o, collections.Counter) else list(o)
 
@@ -438,6 +503,7 @@ def prepare(redo):
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
+    (tmp / "agent_a.json").write_text(json.dumps(agent_a_input(dg), default=_json_default, separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
@@ -472,7 +538,9 @@ if __name__ == "__main__":
         prepare("--redo" in args)
     elif cmd == "status":
         status()
+    elif cmd == "context" and len(args) in (2, 3):
+        context(*args)
     elif cmd == "commit" and args:
         commit(args[0])
     else:
-        sys.exit("usage: retro.py prepare [--redo] | commit <draft.md> | status")
+        sys.exit("usage: retro.py prepare [--redo] | context <session> <turn> [<temp folder>] | commit <draft.md> | status")
