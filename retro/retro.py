@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Helper for the /retro skill. Claude runs these subcommands; the user never does."""
-import collections, glob, html, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, time
+import collections, email.utils, urllib.parse, urllib.request, xml.etree.ElementTree as ET, glob, html, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1008,6 +1008,159 @@ def insights(tmp, wait=300):
     print(out)
 
 
+FEEDS = [  # (name, url, official)
+    ("changelog", "https://code.claude.com/docs/en/changelog/rss.xml", True),
+    ("whats-new", "https://code.claude.com/docs/en/whats-new/rss.xml", True),
+    ("claude.dev", "https://claude.dev/rss.xml", True),
+    ("simonw", "https://simonwillison.net/tags/claude-code.atom", False),
+]
+HTML_SOURCES = [  # for the web agent: WebFetch with a narrow prompt
+    ("claude.com/blog", "https://www.claude.com/blog", "list posts dated after {since}"),
+    ("github trending", "https://github.com/trending?since=monthly", "list repos about AI coding agents, Claude Code, skills, plugins or MCP"),
+]
+PLATFORM_TERMS = ["claude code", "skill", "plugin", "hook", "subagent", "mcp", "marketplace"]
+CATEGORY_TERMS = {
+    "prompting": ["prompt", "plan mode", "claude.md", "agents.md", "instructions"],
+    "context": ["context", "compaction", "/clear", "memory", "1m", "rewind", "fork"],
+    "skills": ["skill", "trigger", "description", "/skill-doctor"],
+    "repeats": ["memory", "claude.md", "docs", "llms.txt"],
+    "cost": ["usage", "token", "cost", "effort", "/usage", "fast mode", "model"],
+    "rework": ["review", "verify", "test", "/code-review", "goal"],
+    "permissions": ["permission", "auto mode", "allow", "deny", "sandbox"],
+    "workflows": ["workflow", "routine", "loop", "hook", "automation", "mod"],
+    "overlap": ["duplicate", "merge", "plugin list", "marketplace"],
+}
+NEWS_KEEP = 40  # non-official items kept after scoring
+NEWS_MIN = 3  # score a non-official item needs
+BODY_MAX = 600
+
+
+def http_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "retro-skill"})
+    return urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+
+
+def parse_date(text):
+    text = (text or "").strip()
+    try:
+        d = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        d = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def parse_feed(xml):
+    """RSS 2.0 or Atom -> [{title, url, date, body}]."""
+    root = ET.fromstring(xml)
+    out = []
+    for e in root.iter():
+        tag = e.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "entry"):
+            continue
+        f = {}
+        for c in e:
+            t = c.tag.rsplit("}", 1)[-1]
+            if t == "link" and c.get("rel") in ("self", "enclosure"):
+                continue
+            f.setdefault(t, c.get("href") or (c.text or ""))
+            if t == "encoded" or t == "content":
+                f["body"] = c.text or ""
+        body = f.get("body") or f.get("description") or f.get("summary") or ""
+        out.append({"title": f.get("title", "").strip(), "url": f.get("link", ""), "body": re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body))).strip(),
+                    "date": f.get("pubDate") or f.get("published") or f.get("updated")})
+    return out
+
+
+def week_start(title):
+    """'Week 37 (Sep 7-11, 2026)' -> that week's first day; the feed's pubDate is re-stamped, so it can't be trusted."""
+    m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* (\d{1,2})\b.*?(\d{4})", title)
+    return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y").replace(tzinfo=timezone.utc) if m else None
+
+
+def fetch_news(since):
+    """Raw items from the script-readable shortlist, newer than `since`. Failures go in `errors`."""
+    cut = parse_date(since)
+    items, errors = [], []
+
+    def attempt(what, fn):
+        try:
+            items.extend(fn())
+        except Exception as e:
+            errors.append(f"{what}: {e}")
+
+    def releases():
+        return [{"source": "claude-code releases", "official": True, "title": r["tag_name"], "url": r["html_url"], "date": r["published_at"],
+                 "body": (r.get("body") or "")[:BODY_MAX]} for r in gh("repos/anthropics/claude-code/releases?per_page=100") if (r.get("published_at") or "") > since]
+
+    def feed(name, url, official):
+        out = []
+        for i in parse_feed(http_get(url)):
+            try:  # one undated item must not cost the feed
+                d = (week_start(i["title"]) if name == "whats-new" else None) or parse_date(i["date"])
+            except ValueError:
+                continue
+            if d > cut:
+                out.append({"source": name, "official": official, "title": i["title"], "url": i["url"], "date": d.isoformat(), "body": i["body"][:BODY_MAX]})
+        return out
+
+    def hn():
+        q = "https://hn.algolia.com/api/v1/search_by_date?" + urllib.parse.urlencode({
+            "query": "claude code", "tags": "story", "restrictSearchableAttributes": "title",
+            "numericFilters": f"created_at_i>{int(cut.timestamp())},points>50", "hitsPerPage": 50})
+        return [{"source": "hacker news", "official": False, "title": h["title"], "url": h.get("url") or f"https://news.ycombinator.com/item?id={h['objectID']}",
+                 "date": h["created_at"], "body": "", "points": h.get("points", 0)} for h in json.loads(http_get(q))["hits"] if h.get("title")]
+
+    def awesome():
+        cs = gh(f"repos/hesreallyhim/awesome-claude-code/commits?since={since}&per_page=100")
+        return [{"source": "awesome-claude-code", "official": False, "title": c["commit"]["message"].splitlines()[0], "url": c["html_url"],
+                 "date": c["commit"]["committer"]["date"], "body": ""} for c in cs if c["commit"]["message"].startswith("Add resource:")]
+
+    def marketplace():
+        repo = "repos/anthropics/claude-plugins-official"
+        old = gh(f"{repo}/commits?until={since}&per_page=1")[0]["sha"]
+        read = lambda ref: {p["name"]: p for p in json.loads(subprocess.run(
+            ["gh", "api", f"{repo}/contents/.claude-plugin/marketplace.json?ref={ref}", "-H", "Accept: application/vnd.github.raw"],
+            capture_output=True, text=True, timeout=60, check=True).stdout)["plugins"]}
+        before, now_ = read(old), read("main")
+        return [{"source": "official marketplace", "official": True, "title": "New official plugin: " + n, "url": "https://github.com/anthropics/claude-plugins-official",
+                 "date": iso(now()), "body": (now_[n].get("description") or "")[:BODY_MAX]} for n in sorted(set(now_) - set(before))]
+
+    attempt("claude-code releases", releases)
+    for name, url, official in FEEDS:
+        attempt(name, lambda: feed(name, url, official))
+    attempt("hacker news", hn)
+    attempt("awesome-claude-code", awesome)
+    attempt("official marketplace", marketplace)
+    return {"items": items, "errors": errors, "html_sources": [{"name": n, "url": u, "prompt": p.format(since=since)} for n, u, p in HTML_SOURCES]}
+
+
+def score_news(items, terms):
+    """Stage 1: title hits 3, body hits 1, official +5 (always kept), HN points >= 100 +3."""
+    pats = [re.compile(r"(?<![\w-])" + re.escape(t.lower()) + r"(?![\w-])") for t in terms if len(t) > 1]
+    for i in items:
+        title, body = i["title"].lower(), i["body"].lower()
+        i["score"] = sum(3 * bool(p.search(title)) + bool(p.search(body)) for p in pats) + 5 * i["official"] + 3 * (i.get("points", 0) >= 100)
+    kept = [i for i in items if i["official"]] + sorted((i for i in items if not i["official"] and i["score"] >= NEWS_MIN), key=lambda i: -i["score"])[:NEWS_KEEP]
+    return kept
+
+
+def news(tmp, categories=()):
+    """Stage-1 filter of news_raw.json with Toolkit, CLI, platform and problem terms; writes news.json."""
+    tmp = Path(tmp)
+    raw = json.loads((tmp / "news_raw.json").read_text())
+    c = load_json(tmp / "agent_c.json")
+    unknown = [x for x in categories if x not in CATEGORY_TERMS]
+    if unknown:
+        print("unknown categories ignored: " + ", ".join(unknown), file=sys.stderr)
+    terms = {i["name"] for i in c.get("items", []) if i["name"] not in BUILTIN_COMMANDS} | {p["plugin"].split("@")[0] for p in c.get("plugins", [])}
+    clis = load_json(tmp / "clis.json")
+    terms |= {x for x in clis if isinstance(x, str)} if isinstance(clis, list) else set()
+    terms |= set(PLATFORM_TERMS) | {t for cat in categories for t in CATEGORY_TERMS.get(cat, [])}
+    out = {"items": score_news(raw["items"], terms), "html_sources": raw["html_sources"], "errors": raw["errors"]}
+    (tmp / "news.json").write_text(json.dumps(out, separators=(",", ":")))
+    print(tmp / "news.json", len(out["items"]), "items")
+
+
 def prepare(redo):
     hint = statusline_hint()
     start = now()
@@ -1037,6 +1190,7 @@ def prepare(redo):
     up = build_upstream(dg, cursor(redo, start))
     (tmp / "upstream.json").write_text(json.dumps(up, separators=(",", ":")))
     (tmp / "clis.json").write_text(json.dumps((up["clis"] or {}).get("installed", []), separators=(",", ":")))  # for the news filter
+    (tmp / "news_raw.json").write_text(json.dumps(fetch_news(cursor(redo, start)), separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
     (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
     print(f"format drift: {dg['drift']} records skipped")
@@ -1075,7 +1229,9 @@ if __name__ == "__main__":
         context(*args)
     elif cmd == "insights" and args:
         insights(args[0])
+    elif cmd == "news" and args:
+        news(args[0], args[1:])
     elif cmd == "commit" and args:
         commit(args[0])
     else:
-        sys.exit("usage: retro.py prepare [--redo] | context <session> <turn> [<temp folder>] | insights <temp folder> | commit <draft.md> | status")
+        sys.exit("usage: retro.py prepare [--redo] | context <session> <turn> [<temp folder>] | insights <temp folder> | news <temp folder> [<category>...] | commit <draft.md> | status")
