@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Helper for the /retro skill. Claude runs these subcommands; the user never does."""
-import collections, glob, json, math, re, shutil, subprocess, sys, tempfile
+import collections, glob, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +23,8 @@ SIMILAR = 0.6  # word-trigram Jaccard at or above this counts as near-identical
 RECUR_SESSIONS = 3  # Bash heads and tool sequences must recur across this many Sessions
 SEQ_LEN = 3  # tools in a recurring sequence
 DESC_MAX = 300  # chars of a Toolkit description kept for agent C
+PATCH_MAX = 1500  # chars of one upstream file diff kept for the port-this judgment
+PATCH_FILES = 8  # changed files per tracked source that carry a diff
 SEQ_MAX = 2000  # tool calls kept per Session for sequence counting
 # Record types the digest knows about or deliberately drops; anything else counts as format drift.
 KNOWN_TYPES = {
@@ -765,11 +767,90 @@ def build_clis(dg):
             "unused_outdated": [f"{n} {v[0]} → {v[1]} · not used this Window" for n, v in sorted(outdated.items()) if n not in used]}
 
 
+def tree_sha(d):
+    """Git tree SHA of a folder, as in the skills lock file's skillFolderHash; None for an empty folder."""
+    ents = []
+    for p in Path(d).iterdir():
+        if p.name == ".DS_Store":
+            continue
+        if p.is_symlink():
+            data, mode = os.readlink(p).encode(), "120000"
+        elif p.is_dir():
+            sha = tree_sha(p)
+            if sha:
+                ents.append((p.name + "/", "40000", p.name, sha))
+            continue
+        else:
+            data, mode = p.read_bytes(), "100755" if os.access(p, os.X_OK) else "100644"
+        ents.append((p.name, mode, p.name, hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()))
+    if not ents:
+        return None
+    body = b"".join(m.encode() + b" " + n.encode() + b"\0" + bytes.fromhex(sha) for _, m, n, sha in sorted(ents, key=lambda e: e[0].encode()))
+    return hashlib.sha1(b"tree %d\0" % len(body) + body).hexdigest()
+
+
+def upstream_entries(skill_md):
+    """The `metadata.upstream` entries ({repo, path, base}) of a SKILL.md, in flow or block YAML."""
+    try:
+        head = re.match(r"\s*---\n(.*?)\n---", skill_md.read_text(errors="replace"), re.S).group(1)
+    except (OSError, AttributeError):
+        return []
+    entries = []
+    for k, v in re.findall(r"\b(repo|path|base)\s*:\s*[\"']?([^\s,\"'}\]]+)", head[head.find("upstream:"):] if "upstream:" in head else ""):
+        if k == "repo":
+            entries.append({})
+        if entries:
+            entries[-1][k] = v
+    return [e for e in entries if len(e) == 3]
+
+
+def build_owned(names, uses, attempt, out):
+    """Owned Skills' upstream changes, edited installs to own, and skills with no provenance. Fills out["owned"]."""
+    owned = out["owned"] = {"tracked": [], "edited_installs": [], "no_provenance": []}
+    for f in sorted((HOME / "skills").glob("*/SKILL.md")):
+        if f.parent.is_symlink():
+            continue
+        name = frontmatter(f).get("name") or f.parent.name
+        entries = upstream_entries(f)
+        if not entries:
+            owned["no_provenance"].append(name)
+        for e in entries:
+            def check(name=name, e=e):
+                path = e["path"].rstrip("/")
+                try:
+                    gh(f"repos/{e['repo']}/contents/{path}")
+                except RuntimeError as err:
+                    if "404" not in str(err):
+                        raise
+                    owned["tracked"].append({"skill": name, **e, "state": "removed upstream"})
+                    return
+                cmp = gh(f"repos/{e['repo']}/compare/{e['base']}...HEAD")
+                files = [x for x in cmp["files"] if x["filename"] == path or x["filename"].startswith(path + "/")]
+                if files:
+                    owned["tracked"].append({"skill": name, **e, "state": "changed", "uses": uses.get(name, 0),
+                                             "commits": [c["commit"]["message"].split("\n")[0] for c in cmp["commits"]][-20:],
+                                             "files": [{"file": x["filename"], "status": x["status"], "patch": (x.get("patch") or "")[:PATCH_MAX] if i < PATCH_FILES else ""}
+                                                       for i, x in enumerate(files)]})
+            attempt(f"owned {name}", check)
+    lock = load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
+    for key, sk in lock.items():
+        d = HOME.parent / ".agents" / "skills" / key
+        if sk.get("sourceType") != "github" or "/" not in (sk.get("skillPath") or "") or not d.is_dir():
+            continue
+        def check(key=key, sk=sk, d=d):
+            if tree_sha(d) == sk["skillFolderHash"]:
+                return
+            base = gh(f"repos/{sk['source']}/commits?until={sk['installedAt']}&per_page=1")[0]["sha"]
+            owned["edited_installs"].append({"skill": names.get(key, key), "lock_key": key, "repo": sk["source"],
+                                             "path": sk["skillPath"].rsplit("/", 1)[0], "base": base, "uses": uses.get(names.get(key, key), 0)})
+        attempt(f"edited install {key}", check)
+
+
 def build_upstream(dg, since, tk=None):
     """What is behind upstream, as plain data for the main session. Each part tolerates a failed call."""
     tk = tk or build_toolkit(dg)
     uses = {r["name"]: r["uses"] for r in tk["items"]}
-    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "clis": None, "errors": []}
+    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "clis": None, "owned": None, "errors": []}
 
     def attempt(what, fn):
         try:
@@ -858,6 +939,7 @@ def build_upstream(dg, since, tk=None):
                                   "upstream_of": "built-in commands, bundled skills and agents"}
     attempt("claude code", claude_code)
     out["clis"] = attempt("clis", lambda: build_clis(dg))
+    build_owned(names, uses, attempt, out)
     return out
 
 
