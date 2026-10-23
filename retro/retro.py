@@ -63,14 +63,20 @@ def now():
 
 
 def findings_timestamp(path):
-    m = re.search(r"^retro_timestamp: (\S+)$", path.read_text().split("---")[1], re.M)
-    return datetime.fromisoformat(m.group(1))
+    """The Retro Timestamp in a findings file. Raises ValueError when it is missing or malformed."""
+    try:
+        m = re.search(r"^retro_timestamp: (\S+)$", path.read_text().split("---")[1], re.M)
+        return datetime.fromisoformat(m.group(1))
+    except (IndexError, AttributeError) as e:
+        raise ValueError("no retro_timestamp") from e
 
 
 def last_retro_start():
     """Start of the gate period: the Retro Timestamp, else the oldest history entry."""
-    if FINDINGS.exists():
+    try:
         return findings_timestamp(FINDINGS)
+    except (OSError, ValueError):
+        pass  # no findings file, or a corrupt one: fall back to history
     try:
         with HISTORY.open() as f:
             first = json.loads(f.readline())
@@ -80,10 +86,11 @@ def last_retro_start():
 
 
 def status():
-    if not FINDINGS.exists():
+    try:
+        days = (now() - findings_timestamp(FINDINGS)).days
+    except (OSError, ValueError):  # none yet, or unreadable
         print("retro due")
         return
-    days = (now() - findings_timestamp(FINDINGS)).days
     if days == GATE_DAYS:
         print("retro due")
     elif days > GATE_DAYS:
@@ -111,14 +118,75 @@ def statusline_hint():
     return f"Statusline hint: statusLine ({cmd}) has no `retro.py status` call; offer to add it."
 
 
+def is_main(d):
+    """A digest of a main Session, not a subagent's."""
+    return "agentId" not in d
+
+
 def iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def command_words(cmd):
+    """First word of each command in a Bash string: past `cd x &&`, pipes, `;` and `FOO=1` prefixes."""
+    words = []
+    for seg in re.split(r"&&|\|\||[;|\n]", cmd):
+        toks = [t for t in seg.split() if not re.fullmatch(r"\w+=\S*", t)]
+        if toks:
+            words.append(toks[0])
+    return words
 
 
 def text_of(c):
     if isinstance(c, str):
         return c
     return " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+
+
+def tally_requests(d, reqs):
+    """Fold each deduped request's tokens into the Session totals, per model and effort, and into its turn's cache writes."""
+    for i, q in enumerate(reqs.values()):
+        u, model, effort, turn = q["usage"], q["model"], q["effort"], q["turn"]
+        d["models"][model] += 1
+        tok = {"in": u.get("input_tokens", 0), "cache_read": u.get("cache_read_input_tokens", 0),
+               "cache_write": u.get("cache_creation_input_tokens", 0), "out": u.get("output_tokens", 0),
+               "thinking": (u.get("output_tokens_details") or {}).get("thinking_tokens", 0)}
+        d["tokens"].update(tok)
+        d["tokens_by_model"][model].update(tok)
+        d["tokens_by_effort"][effort].update(tok)
+        ctx = tok["in"] + tok["cache_read"] + tok["cache_write"]
+        d["peak_ctx"] = max(d["peak_ctx"], ctx)
+        d["ctx_sum"] += ctx
+        if i == 0:
+            d["first_ctx"] = ctx
+        if turn is not None:
+            turn["_cw"] = turn.get("_cw", 0) + tok["cache_write"]
+        if q["skill"]:
+            d["attrib_skill_out"][q["skill"]] += tok["out"]
+
+
+def flag_turns(d, full):
+    """Flag interrupted, steered, churning and error-looping turns; drop the detail from the rest unless `full`."""
+    for t in d["turns"]:
+        edits, errors = t.pop("edits"), t.pop("errors")
+        churn = {f: n for f, n in edits.items() if n >= CHURN_EDITS}
+        flags = [k for k, on in (("interrupted", t.get("interrupted")), ("steered", t.get("steered")),
+                                 ("edit_churn", churn), ("error_loop", len(errors) >= ERROR_LOOP)) if on]
+        if flags:
+            t["flags"] = flags
+            if churn:
+                t["churn"] = churn
+            if errors:
+                t["errors"] = errors[:5]
+        if full:
+            t["edits"], t["errors"] = edits, errors
+        elif not flags:
+            t.pop("prev_tail")
+        if not t.get("prev_tail"):
+            t.pop("prev_tail", None)
+        cw = t.pop("_cw", 0)
+        if cw >= CACHE_WRITE_HEAVY:
+            d["cache_heavy"].append({"ts": t["ts"], "cache_write": cw, "prompt": t["prompt"][:80]})
 
 
 def digest_session(path, lo, hi, parent_cut=None, full=False):
@@ -188,7 +256,8 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
                 txt = text_of(m.get("content") or []).strip()
                 if txt:
                     reply = txt[-(10 * TAIL_MAX if full else TAIL_MAX):]
-                reqs[r.get("requestId") or r.get("uuid")] = (m.get("model"), m.get("usage") or {}, r.get("attributionSkill"), str(r.get("effort")), cur)
+                reqs[r.get("requestId") or r.get("uuid")] = {"model": m.get("model"), "usage": m.get("usage") or {}, "skill": r.get("attributionSkill"),
+                                                             "effort": str(r.get("effort")), "turn": cur}
                 d["effort"][str(r.get("effort"))] += 1
                 if r.get("isApiErrorMessage"):
                     d["api_errors"] += 1
@@ -207,7 +276,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
                         if n == "Bash":
                             cmd = (inp.get("command") or "").strip().split()
                             if cmd:
-                                d["bash_words"].add(cmd[0])
+                                d["bash_words"].update(command_words(" ".join(cmd)))
                                 head = " ".join(cmd[:2]) if cmd[0] in ("git", "gh", "npm", "uv", "claude", "openspec") else cmd[0]
                                 d["bash_heads"][head] += 1
                         tool_by_uuid[r.get("uuid")] = tool_by_uuid[c.get("id")] = f"{n} {head}".strip()
@@ -274,43 +343,8 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
                     listing = a.get("names")
         except Exception:
             drift += 1
-    for i, (model, u, sk, effort, turn) in enumerate(reqs.values()):
-        d["models"][model] += 1
-        tok = {"in": u.get("input_tokens", 0), "cache_read": u.get("cache_read_input_tokens", 0),
-               "cache_write": u.get("cache_creation_input_tokens", 0), "out": u.get("output_tokens", 0),
-               "thinking": (u.get("output_tokens_details") or {}).get("thinking_tokens", 0)}
-        d["tokens"].update(tok)
-        d["tokens_by_model"][model].update(tok)
-        d["tokens_by_effort"][effort].update(tok)
-        ctx = tok["in"] + tok["cache_read"] + tok["cache_write"]
-        d["peak_ctx"] = max(d["peak_ctx"], ctx)
-        d["ctx_sum"] += ctx
-        if i == 0:
-            d["first_ctx"] = ctx
-        if turn is not None:
-            turn["_cw"] = turn.get("_cw", 0) + tok["cache_write"]
-        if sk:
-            d["attrib_skill_out"][sk] += tok["out"]
-    for t in d["turns"]:
-        edits, errors = t.pop("edits"), t.pop("errors")
-        churn = {f: n for f, n in edits.items() if n >= CHURN_EDITS}
-        flags = [k for k, on in (("interrupted", t.get("interrupted")), ("steered", t.get("steered")),
-                                 ("edit_churn", churn), ("error_loop", len(errors) >= ERROR_LOOP)) if on]
-        if flags:
-            t["flags"] = flags
-            if churn:
-                t["churn"] = churn
-            if errors:
-                t["errors"] = errors[:5]
-        if full:
-            t["edits"], t["errors"] = edits, errors
-        elif not flags:
-            t.pop("prev_tail")
-        if not t.get("prev_tail"):
-            t.pop("prev_tail", None)
-        cw = t.pop("_cw", 0)
-        if cw >= CACHE_WRITE_HEAVY:
-            d["cache_heavy"].append({"ts": t["ts"], "cache_write": cw, "prompt": t["prompt"][:80]})
+    tally_requests(d, reqs)
+    flag_turns(d, full)
     d["start"], d["end"], d["requests"] = first, last, len(reqs)
     d["versions"] = sorted(d["versions"])
     d["tool_errors"] = collections.Counter(d["tool_errors"]).most_common(10)
@@ -324,7 +358,7 @@ def instruction_files(dg):
     """CLAUDE.md files over the line limit, or changed or grown during the Window."""
     lo = dg["window"]["start"]
     lo_epoch = datetime.fromisoformat(lo.replace("Z", "+00:00")).timestamp()
-    dirs = {Path(d["cwd"]) for d in dg["sessions"] if d.get("cwd") and "agentId" not in d}
+    dirs = {Path(d["cwd"]) for d in dg["sessions"] if d.get("cwd") and is_main(d)}
     paths = {HOME / "CLAUDE.md"} | {p / n for p in dirs for n in ("CLAUDE.md", ".claude/CLAUDE.md")}
     out = []
     for f in sorted(paths):
@@ -349,7 +383,7 @@ def instruction_files(dg):
 def compute_metrics(dg):
     """Numbers and rubric candidates for categories 2, 5 and 7. Writes no Finding."""
     ss = dg["sessions"]
-    mains = [d for d in ss if "agentId" not in d]
+    mains = [d for d in ss if is_main(d)]
     top = lambda c, n=15: dict(collections.Counter(c).most_common(n))
     tok_total = lambda c: c.get("in", 0) + c.get("cache_write", 0) + c.get("out", 0)
 
@@ -370,8 +404,7 @@ def compute_metrics(dg):
         "instruction_files": instruction_files(dg),
         "rubric_candidates": [f"{len(no_clear)} Sessions had 2+ interrupts and no /clear: {no_clear[:10]}"] if no_clear else [],
     }
-    by = lambda key: collections.defaultdict(collections.Counter)
-    by_project, by_model, by_effort = by(0), by(0), by(0)
+    by_project, by_model, by_effort = (collections.defaultdict(collections.Counter) for _ in range(3))
     usd_project, skill_out = collections.Counter(), collections.Counter()
     allt = collections.Counter()
     for d in ss:
@@ -397,7 +430,7 @@ def compute_metrics(dg):
                          for d in sorted(mains, key=lambda d: -tok_total(d["tokens"]))[:10]],
         "cache_heavy_turns": sorted([{"file": d["file"], **t} for d in ss for t in d["cache_heavy"]], key=lambda t: -t["cache_write"])[:10],
         "expensive_subagents": [{"file": d["file"], "agent": d.get("agent"), **dict(d["tokens"])}
-                                for d in sorted([d for d in ss if "agentId" in d], key=lambda d: -tok_total(d["tokens"]))[:5]],
+                                for d in sorted([d for d in ss if not is_main(d)], key=lambda d: -tok_total(d["tokens"]))[:5]],
         "fixed_overhead_ctx": {"median": firsts[len(firsts) // 2] if firsts else 0,
                                "mean": sum(firsts) // max(len(firsts), 1), "sessions": len(firsts)},
     }
@@ -479,7 +512,7 @@ def build_digest(start):
                 drift += 1
     except OSError:
         pass
-    mains_in = [d for d in sessions if "agentId" not in d]
+    mains_in = [d for d in sessions if is_main(d)]
     return {"window": {"start": lo, "end": hi}, "drift": drift, "sessions": sessions,
             "skill_listings": listings, "history": history,
             "n_sessions": len(mains_in), "n_projects": len({d.get("cwd") for d in mains_in})}
@@ -487,11 +520,11 @@ def build_digest(start):
 
 def agent_a_input(dg):
     """Agent A's slice: every main Session's turns, indexed for `retro.py context`."""
-    keep = ("i", "ts", "prompt", "len", "ms", "flags", "steering", "churn", "errors", "prev_tail")
+    keep = ("ts", "prompt", "len", "ms", "flags", "steering", "churn", "errors", "prev_tail")
     return {"sessions": [{"session": d["file"], "project": d.get("cwd"), "title": d.get("title"),
                           "interrupts": d["interrupts"], "slash": d["slash"],
-                          "turns": [{k: t[k] for k in keep if k in t} for t in (dict(t, i=i) for i, t in enumerate(d["turns"]))]}
-                         for d in dg["sessions"] if "agentId" not in d and d["turns"]]}
+                          "turns": [{"i": i, **{k: t[k] for k in keep if k in t}} for i, t in enumerate(d["turns"])]}
+                         for d in dg["sessions"] if is_main(d) and d["turns"]]}
 
 
 def norm(s):
@@ -523,7 +556,7 @@ def clusters(items):
 
 def agent_b_input(dg):
     """Agent B's slice: typed prompts plus whole-Window repeat candidates for categories 4 and 8."""
-    mains = [d for d in dg["sessions"] if "agentId" not in d and d["turns"]]
+    mains = [d for d in dg["sessions"] if is_main(d) and d["turns"]]
     prompts = [(d["file"], t["prompt"]) for d in mains for t in d["turns"]]
     exact = collections.defaultdict(set)
     for f, p in prompts:
@@ -576,11 +609,22 @@ def load_json(path):
         return {}
 
 
+def skill_lock():
+    """The skills CLI lock file's entries by lock key."""
+    return load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
+
+
+def installed_plugins():
+    """(plugin id, its first install record) for each installed plugin."""
+    for pid, installs in (load_json(HOME / "plugins" / "installed_plugins.json").get("plugins") or {}).items():
+        yield pid, installs[0] if isinstance(installs, list) and installs and isinstance(installs[0], dict) else {}
+
+
 def build_toolkit(dg):
     """One row per invocable item, plus the plugin list. Tolerates missing or changed layouts."""
     claude_json = load_json(HOME.parent / ".claude.json")
     lifetime = lambda n: (claude_json.get("skillUsage", {}).get(n) or {}).get("usageCount")
-    lock = load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
+    lock = skill_lock()
     uses, tool_uses = collections.Counter(), collections.Counter()
     for d in dg["sessions"]:
         uses.update(d["skills_invoked"])
@@ -611,7 +655,7 @@ def build_toolkit(dg):
         for sk in load_json(m).get("skills", []):
             if sk.get("name"):
                 add("anthropic-skills:" + sk["name"], f"claude.ai synced ({sk.get('source')})", True, sk.get("description"))
-    cwds = {d["cwd"] for d in dg["sessions"] if d.get("cwd") and "agentId" not in d}
+    cwds = {d["cwd"] for d in dg["sessions"] if d.get("cwd") and is_main(d)}
     for cwd in sorted(cwds | {h["project"] for h in dg["history"] if h.get("project")}):
         proj = Path(cwd) / ".claude"
         if proj == HOME:
@@ -627,8 +671,7 @@ def build_toolkit(dg):
     for f in sorted((HOME / "agents").glob("*.md")):
         add("agent:" + (frontmatter(f).get("name") or f.stem), "user agent", True, frontmatter(f).get("description"))
     plugins = []
-    for pid, installs in (load_json(HOME / "plugins" / "installed_plugins.json").get("plugins") or {}).items():
-        inst = installs[0] if isinstance(installs, list) and installs and isinstance(installs[0], dict) else {}
+    for pid, inst in installed_plugins():
         pname, root = pid.split("@")[0], Path(inst.get("installPath", "/nonexistent"))
         names = []
         for f in sorted(root.glob("skills/*/SKILL.md")):
@@ -665,7 +708,7 @@ def dead_slash(dg, items):
         if m:
             typed[m.group(1)] += 1
     for d in dg["sessions"]:
-        if "agentId" not in d:
+        if is_main(d):
             for n in d["slash"]:
                 typed.setdefault(n, 1)
     return {n: c for n, c in sorted(typed.items()) if n not in known}
@@ -674,11 +717,12 @@ def dead_slash(dg, items):
 def agent_c_input(dg):
     """Agent C's slice: the Toolkit table and the prompts to match against it. Never split."""
     prompts = [{"session": d["file"], "project": d.get("cwd"), "prompts": [t["prompt"] for t in d["turns"]]}
-               for d in dg["sessions"] if "agentId" not in d and d["turns"]]
+               for d in dg["sessions"] if is_main(d) and d["turns"]]
     tk = build_toolkit(dg)
     return {**tk, "dead_slash": dead_slash(dg, tk["items"]), "sessions": prompts}
 
 
+AGENT_INPUTS = {"a": agent_a_input, "b": agent_b_input, "c": agent_c_input}
 AGENT_CATEGORIES = {"a": {"prompting", "rework"}, "b": {"repeats", "workflows"}, "c": {"skills", "overlap"}}
 
 
@@ -704,7 +748,7 @@ def cursor(redo, start):
     path = PREV if redo else FINDINGS
     try:
         return iso(findings_timestamp(path))
-    except (OSError, IndexError, AttributeError, ValueError):
+    except (OSError, ValueError):
         return iso(start - timedelta(days=GATE_DAYS))
 
 
@@ -717,6 +761,11 @@ def run_json(cmd):
 
 def gh(path):
     return run_json(["gh", "api", path])
+
+
+def gh_raw(path):
+    """A GitHub contents file as JSON."""
+    return run_json(["gh", "api", path, "-H", "Accept: application/vnd.github.raw"])
 
 
 def vkey(v):
@@ -758,14 +807,14 @@ def build_clis(dg):
     used = sorted(n for n in used if n in installed)
     outdated = {}
     for n in (o for o in run_outdated(["brew", "outdated", "--json=v2"]).get("formulae", []) if o["name"] in installed):
-        outdated[n["name"]] = (n["installed_versions"][-1], n["current_version"], "brew upgrade " + n["name"])
+        outdated[n["name"]] = {"installed": n["installed_versions"][-1], "latest": n["current_version"], "update": "brew upgrade " + n["name"]}
     for n, o in run_outdated(["npm", "outdated", "-g", "--json"]).items():
         if n in installed:
             o = o[-1] if isinstance(o, list) else o  # one entry per location
-            outdated[n] = (o.get("current", "?"), o.get("latest", "?"), "npm install -g " + n)
+            outdated[n] = {"installed": o.get("current", "?"), "latest": o.get("latest", "?"), "update": "npm install -g " + n}
     return {"installed": sorted(installed), "used": used,
-            "outdated_used": [{"name": n, "installed": v[0], "latest": v[1], "update": v[2]} for n, v in sorted(outdated.items()) if n in used],
-            "unused_outdated": [f"{n} {v[0]} → {v[1]} · not used this Window" for n, v in sorted(outdated.items()) if n not in used]}
+            "outdated_used": [{"name": n, **v} for n, v in sorted(outdated.items()) if n in used],
+            "unused_outdated": [f"{n} {v['installed']} → {v['latest']} · not used this Window" for n, v in sorted(outdated.items()) if n not in used]}
 
 
 def tree_sha(d):
@@ -805,15 +854,15 @@ def upstream_entries(skill_md):
     return [e for e in entries if len(e) == 3]
 
 
-def build_owned(names, uses, attempt, out):
-    """Owned Skills' upstream changes, edited installs to own, and skills with no provenance. Fills out["owned"]."""
+def build_owned(names, uses, attempt, out, first):
+    """Owned Skills' upstream changes, edited installs to own, and (in the first Retro only) skills with no provenance. Fills out["owned"]."""
     owned = out["owned"] = {"tracked": [], "edited_installs": [], "no_provenance": []}
     for f in sorted((HOME / "skills").glob("*/SKILL.md")):
         if f.parent.is_symlink():
             continue
         name = frontmatter(f).get("name") or f.parent.name
         entries = upstream_entries(f)
-        if not entries:
+        if not entries and first:
             owned["no_provenance"].append(name)
         for e in entries:
             def check(name=name, e=e):
@@ -833,7 +882,7 @@ def build_owned(names, uses, attempt, out):
                                              "files": [{"file": x["filename"], "status": x["status"], "patch": (x.get("patch") or "")[:PATCH_MAX] if i < PATCH_FILES else ""}
                                                        for i, x in enumerate(files)]})
             attempt(f"owned {name}", check)
-    lock = load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
+    lock = skill_lock()
     for key, sk in lock.items():
         d = HOME.parent / ".agents" / "skills" / key
         if sk.get("sourceType") != "github" or "/" not in (sk.get("skillPath") or "") or not d.is_dir():
@@ -847,25 +896,10 @@ def build_owned(names, uses, attempt, out):
         attempt(f"edited install {key}", check)
 
 
-def build_upstream(dg, since, tk=None):
-    """What is behind upstream, as plain data for the main session. Each part tolerates a failed call."""
-    tk = tk or build_toolkit(dg)
-    uses = {r["name"]: r["uses"] for r in tk["items"]}
-    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "clis": None, "owned": None, "errors": []}
-
-    def attempt(what, fn):
-        try:
-            return fn()
-        except Exception as e:  # missing gh, no network, changed layout
-            out["errors"].append(f"{what}: {e}")
-
-    lock = load_json(HOME.parent / ".agents" / ".skill-lock.json").get("skills", {})
-    names = {}  # lock key -> the name the Toolkit table uses
-    for f in (HOME / "skills").glob("*/SKILL.md"):
-        if f.parent.is_symlink():
-            names[f.parent.resolve().name] = frontmatter(f).get("name") or f.parent.name
+def skills_behind(out, attempt, names, uses, since):
+    """Lock-file skills whose upstream folder changed or vanished, with their repos' commit headlines."""
     repos = collections.defaultdict(dict)
-    for key, sk in lock.items():
+    for key, sk in skill_lock().items():
         if sk.get("sourceType") == "github" and "/" in (sk.get("skillPath") or ""):  # a repo-root skill has no tree entry
             repos[sk["source"]][key] = sk
     for repo, group in repos.items():
@@ -886,16 +920,20 @@ def build_upstream(dg, since, tk=None):
             if commits is not None:
                 out["commits"][repo] = commits
         attempt(f"skills {repo}", check)
-    def synced():
-        for m in (HOME / "skills" / "synced").glob("*/manifest.json"):
-            for sk in load_json(m).get("skills", []):
-                n = "anthropic-skills:" + sk.get("name", "?")
-                if isinstance(sk.get("updatedAt"), str) and sk["updatedAt"] > since:
-                    out["synced"].append({"name": n, "updated": sk["updatedAt"], "uses": uses.get(n, 0)})
-    attempt("synced skills", synced)
+
+
+def synced_updated(out, uses, since):
+    for m in (HOME / "skills" / "synced").glob("*/manifest.json"):
+        for sk in load_json(m).get("skills", []):
+            n = "anthropic-skills:" + sk.get("name", "?")
+            if isinstance(sk.get("updatedAt"), str) and sk["updatedAt"] > since:
+                out["synced"].append({"name": n, "updated": sk["updatedAt"], "uses": uses.get(n, 0)})
+
+
+def plugins_behind(out, attempt, tk, since):
+    """Installed plugins behind their marketplace repo, with the releases since the cursor."""
     markets = load_json(HOME / "plugins" / "known_marketplaces.json")
-    for pid, installs in (load_json(HOME / "plugins" / "installed_plugins.json").get("plugins") or {}).items():
-        inst = installs[0] if isinstance(installs, list) and installs and isinstance(installs[0], dict) else {}
+    for pid, inst in installed_plugins():
         pname, _, market = pid.partition("@")
         repo = ((markets.get(market) or {}).get("source") or {}).get("repo") if isinstance(markets.get(market), dict) else None
         if not isinstance(repo, str):
@@ -906,16 +944,14 @@ def build_upstream(dg, since, tk=None):
                    "uses": next((p["uses"] for p in tk["plugins"] if p["plugin"] == pid), 0), "update": f"claude plugin update {pid}"}
             latest = None
             try:  # a pinned version wins; else compare commits
-                mk = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/contents/.claude-plugin/marketplace.json", "-H",
-                                                "Accept: application/vnd.github.raw"], capture_output=True, text=True, timeout=60).stdout)
+                mk = gh_raw(f"repos/{repo}/contents/.claude-plugin/marketplace.json")
                 latest = next((p.get("version") for p in mk.get("plugins", []) if p.get("name") == pname), None)
-            except ValueError:
+            except (ValueError, RuntimeError):
                 pass
             if not latest:
                 try:
-                    latest = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/contents/.claude-plugin/plugin.json", "-H",
-                                                        "Accept: application/vnd.github.raw"], capture_output=True, text=True, timeout=60).stdout).get("version")
-                except ValueError:
+                    latest = gh_raw(f"repos/{repo}/contents/.claude-plugin/plugin.json").get("version")
+                except (ValueError, RuntimeError):
                     pass
             if latest and inst.get("version"):
                 behind = vkey(latest) > vkey(inst["version"])
@@ -929,23 +965,49 @@ def build_upstream(dg, since, tk=None):
                 out["plugins"].append(row)
         attempt(f"plugin {pid}", check)
 
-    def claude_code():
-        installed = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30).stdout.split()[0]
-        times = run_json(["npm", "view", "@anthropic-ai/claude-code", "time", "--json"])
-        vs = {v: t for v, t in times.items() if re.fullmatch(r"\d+\.\d+\.\d+", v)}
-        latest = max(vs, key=vkey)
-        if vkey(latest) > vkey(installed):
-            out["claude_code"] = {"installed": installed, "latest": latest, "update": "claude update",
-                                  "releases_since_cursor": sorted((v for v, t in vs.items() if t > since), key=vkey)[-60:],
-                                  "upstream_of": "built-in commands, bundled skills and agents"}
-    attempt("claude code", claude_code)
+
+def claude_code_behind(out, since):
+    installed = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=30).stdout.split()[0]
+    times = run_json(["npm", "view", "@anthropic-ai/claude-code", "time", "--json"])
+    vs = {v: t for v, t in times.items() if re.fullmatch(r"\d+\.\d+\.\d+", v)}
+    latest = max(vs, key=vkey)
+    if vkey(latest) > vkey(installed):
+        out["claude_code"] = {"installed": installed, "latest": latest, "update": "claude update",
+                              "releases_since_cursor": sorted((v for v, t in vs.items() if t > since), key=vkey)[-60:],
+                              "upstream_of": "built-in commands, bundled skills and agents"}
+
+
+def build_upstream(dg, since, first=False, tk=None):
+    """What is behind upstream, as plain data for the main session. Each part tolerates a failed call."""
+    tk = tk or build_toolkit(dg)
+    uses = {r["name"]: r["uses"] for r in tk["items"]}
+    out = {"since": since, "skills": [], "synced": [], "plugins": [], "commits": {}, "claude_code": None, "clis": None, "owned": None, "errors": []}
+
+    def attempt(what, fn):
+        try:
+            return fn()
+        except Exception as e:  # missing gh, no network, changed layout
+            out["errors"].append(f"{what}: {e}")
+
+    names = {}  # lock key -> the name the Toolkit table uses
+    for f in (HOME / "skills").glob("*/SKILL.md"):
+        if f.parent.is_symlink():
+            names[f.parent.resolve().name] = frontmatter(f).get("name") or f.parent.name
+    skills_behind(out, attempt, names, uses, since)
+    attempt("synced skills", lambda: synced_updated(out, uses, since))
+    plugins_behind(out, attempt, tk, since)
+    attempt("claude code", lambda: claude_code_behind(out, since))
     out["clis"] = attempt("clis", lambda: build_clis(dg))
-    build_owned(names, uses, attempt, out)
+    build_owned(names, uses, attempt, out, first)
     return out
 
 
 def _json_default(o):
     return dict(o) if isinstance(o, collections.Counter) else list(o)
+
+
+def dumps(o):
+    return json.dumps(o, default=_json_default, separators=(",", ":"))
 
 
 def usage_line():
@@ -966,12 +1028,12 @@ def start_insights(tmp):
                      cwd=tmp, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def insights(tmp, wait=300):
+def insights(tmp):
     """Wait for the background /insights run, then write insights.json: date range and the four sections as text, or an error."""
     tmp = Path(tmp)
     out = tmp / "insights.json"
     try:
-        for _ in range(wait):
+        for _ in range(300):
             if (tmp / "insights_done").exists():
                 break
             time.sleep(1)
@@ -1064,7 +1126,7 @@ def parse_feed(xml):
             if t == "link" and c.get("rel") in ("self", "enclosure"):
                 continue
             f.setdefault(t, c.get("href") or (c.text or ""))
-            if t == "encoded" or t == "content":
+            if t in ("encoded", "content"):
                 f["body"] = c.text or ""
         body = f.get("body") or f.get("description") or f.get("summary") or ""
         out.append({"title": f.get("title", "").strip(), "url": f.get("link", ""), "body": re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body))).strip(),
@@ -1072,10 +1134,18 @@ def parse_feed(xml):
     return out
 
 
+MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+
 def week_start(title):
-    """'Week 37 (Sep 7-11, 2026)' -> that week's first day; the feed's pubDate is re-stamped, so it can't be trusted."""
-    m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* (\d{1,2})\b.*?(\d{4})", title)
-    return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y").replace(tzinfo=timezone.utc) if m else None
+    """'Week 37 (Sep 7-11, 2026)' -> that week's first day; the feed's pubDate is re-stamped, so it can't be trusted.
+    The year is the end date's, so 'Dec 29 - Jan 2, 2027' starts in 2026."""
+    days = re.findall("(%s)[a-z]* (\\d{1,2})\\b" % "|".join(MONTHS), title)
+    year = re.search(r"\b(\d{4})\b", title)
+    if not (days and year):
+        return None
+    y = int(year.group(1)) - (MONTHS.index(days[-1][0]) < MONTHS.index(days[0][0]))
+    return datetime.strptime(f"{days[0][0]} {days[0][1]} {y}", "%b %d %Y").replace(tzinfo=timezone.utc)
 
 
 def fetch_news(since):
@@ -1119,12 +1189,10 @@ def fetch_news(since):
     def marketplace():
         repo = "repos/anthropics/claude-plugins-official"
         old = gh(f"{repo}/commits?until={since}&per_page=1")[0]["sha"]
-        read = lambda ref: {p["name"]: p for p in json.loads(subprocess.run(
-            ["gh", "api", f"{repo}/contents/.claude-plugin/marketplace.json?ref={ref}", "-H", "Accept: application/vnd.github.raw"],
-            capture_output=True, text=True, timeout=60, check=True).stdout)["plugins"]}
-        before, now_ = read(old), read("main")
+        read = lambda ref: {p["name"]: p for p in gh_raw(f"{repo}/contents/.claude-plugin/marketplace.json?ref={ref}")["plugins"]}
+        before, after = read(old), read("main")
         return [{"source": "official marketplace", "official": True, "title": "New official plugin: " + n, "url": "https://github.com/anthropics/claude-plugins-official",
-                 "date": iso(now()), "body": (now_[n].get("description") or "")[:BODY_MAX]} for n in sorted(set(now_) - set(before))]
+                 "date": iso(now()), "body": (after[n].get("description") or "")[:BODY_MAX]} for n in sorted(set(after) - set(before))]
 
     attempt("claude-code releases", releases)
     for name, url, official in FEEDS:
@@ -1141,8 +1209,7 @@ def score_news(items, terms):
     for i in items:
         title, body = i["title"].lower(), i["body"].lower()
         i["score"] = sum(3 * bool(p.search(title)) + bool(p.search(body)) for p in pats) + 5 * i["official"] + 3 * (i.get("points", 0) >= 100)
-    kept = [i for i in items if i["official"]] + sorted((i for i in items if not i["official"] and i["score"] >= NEWS_MIN), key=lambda i: -i["score"])[:NEWS_KEEP]
-    return kept
+    return [i for i in items if i["official"]] + sorted((i for i in items if not i["official"] and i["score"] >= NEWS_MIN), key=lambda i: -i["score"])[:NEWS_KEEP]
 
 
 def news(tmp, categories=()):
@@ -1154,35 +1221,34 @@ def news(tmp, categories=()):
     if unknown:
         print("unknown categories ignored: " + ", ".join(unknown), file=sys.stderr)
     terms = {i["name"] for i in c.get("items", []) if i["name"] not in BUILTIN_COMMANDS} | {p["plugin"].split("@")[0] for p in c.get("plugins", [])}
-    clis = load_json(tmp / "clis.json")
-    terms |= {x for x in clis if isinstance(x, str)} if isinstance(clis, list) else set()
+    terms |= set((load_json(tmp / "upstream.json").get("clis") or {}).get("installed", []))
     terms |= set(PLATFORM_TERMS) | {t for cat in categories for t in CATEGORY_TERMS.get(cat, [])}
     out = {"items": score_news(raw["items"], terms), "html_sources": raw["html_sources"], "errors": raw["errors"]}
-    (tmp / "news.json").write_text(json.dumps(out, separators=(",", ":")))
+    (tmp / "news.json").write_text(dumps(out))
     print(tmp / "news.json", len(out["items"]), "items")
 
 
-def split_input(inp, cap=None):
-    """Cut an agent input into ceil(tokens / cap) pieces of whole Sessions in time order. B's whole-Window lists go to every piece; only the first keeps previous_findings."""
-    cap = cap or SPLIT_TOKENS
-    size = lambda o: len(json.dumps(o, default=_json_default, separators=(",", ":"))) / 4
-    if size(inp) <= cap:
-        return [inp]
+def split_input(inp):
+    """Cut an agent input into pieces of whole Sessions in time order, each about SPLIT_TOKENS.
+    The rest of the input (B's whole-Window lists, `previous_findings`) rides along in every piece."""
+    size = lambda o: len(dumps(o)) / 4
     ss = inp["sessions"]
-    fixed = size({k: v for k, v in inp.items() if k != "sessions"})  # B's lists ride along in every piece
-    n = math.ceil(sum(size(x) for x in ss) / (cap - fixed if cap > fixed else cap))
-    per = sum(size(x) for x in ss) / n
+    if not ss or size(inp) <= SPLIT_TOKENS:
+        return [inp]
+    rest = {k: v for k, v in inp.items() if k != "sessions"}
+    sizes = [size(x) for x in ss]
+    room = max(SPLIT_TOKENS - size(rest), SPLIT_TOKENS // 4)  # a big fixed part overshoots the cap rather than blocking the split
+    n = math.ceil(sum(sizes) / room)
+    per = sum(sizes) / n
     pieces, cur, acc = [], [], 0
-    for x in ss:
+    for x, sz in zip(ss, sizes):
         if cur and acc >= per and len(pieces) < n - 1:
             pieces.append(cur)
             cur, acc = [], 0
         cur.append(x)
-        acc += size(x)
+        acc += sz
     pieces.append(cur)
-    rest = {k: v for k, v in inp.items() if k not in ("sessions", "previous_findings")}
-    return [{**rest, **({"previous_findings": inp["previous_findings"]} if i == 0 and "previous_findings" in inp else {}), "sessions": ps}
-            for i, ps in enumerate(pieces)]
+    return [{**rest, "sessions": ps} for ps in pieces]
 
 
 def prepare(redo):
@@ -1203,29 +1269,26 @@ def prepare(redo):
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
     start_insights(tmp)
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
-    (tmp / "digest.json").write_text(json.dumps(dg, default=_json_default, separators=(",", ":")))
+    (tmp / "digest.json").write_text(dumps(dg))
     prev = previous_findings(redo)
     splits = {}
-    for a, fn in (("a", agent_a_input), ("b", agent_b_input), ("c", agent_c_input)):
+    for a, fn in AGENT_INPUTS.items():
         inp = fn(dg)
         if prev is not None:
             inp["previous_findings"] = prev[a]
         pieces = split_input(inp) if a != "c" else [inp]  # C is never split
+        names = [f"agent_{a}_{i + 1}.json" for i in range(len(pieces))] if len(pieces) > 1 else [f"agent_{a}.json"]
         if len(pieces) > 1:
-            names = [f"agent_{a}_{i + 1}.json" for i in range(len(pieces))]
             splits[a] = names
-            for nm, pc in zip(names, pieces):
-                (tmp / nm).write_text(json.dumps(pc, default=_json_default, separators=(",", ":")))
-        else:
-            (tmp / f"agent_{a}.json").write_text(json.dumps(inp, default=_json_default, separators=(",", ":")))
+        for nm, pc in zip(names, pieces):
+            (tmp / nm).write_text(dumps(pc))
     (tmp / "splits.json").write_text(json.dumps(splits))
     (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
-    up = build_upstream(dg, cursor(redo, start))
+    up = build_upstream(dg, cursor(redo, start), first=prev is None)
     (tmp / "upstream.json").write_text(json.dumps(up, separators=(",", ":")))
-    (tmp / "clis.json").write_text(json.dumps((up["clis"] or {}).get("installed", []), separators=(",", ":")))  # for the news filter
     (tmp / "news_raw.json").write_text(json.dumps(fetch_news(cursor(redo, start)), separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
-    (tmp / "metrics.json").write_text(json.dumps(compute_metrics(dg), default=_json_default, separators=(",", ":")))
+    (tmp / "metrics.json").write_text(dumps(compute_metrics(dg)))
     for a, names in splits.items():
         print(f"agent {a.upper()} input split into {len(names)} pieces: see splits.json")
     print(f"format drift: {dg['drift']} records skipped")
@@ -1242,7 +1305,8 @@ def commit(draft):
     STATE.mkdir(parents=True, exist_ok=True)
     new = FINDINGS.with_suffix(".md.tmp")
     body = draft.read_text()
-    n = len(re.findall(r"^### \d+\.", body, re.M))
+    findings = re.search(r"^## Findings\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+    n = len(re.findall(r"^### \d+\.", findings.group(1) if findings else "", re.M))
     body = re.sub(r"Findings: \d+", f"Findings: {n}", body, count=1)
     new.write_text(f"---\nretro_timestamp: {state['timestamp']}\n---\n\n{body}")
     if not state["redo"] and FINDINGS.exists():
