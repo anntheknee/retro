@@ -118,6 +118,33 @@ def statusline_hint():
     return f"Statusline hint: statusLine ({cmd}) has no `retro.py status` call; offer to add it."
 
 
+def session_model():
+    """The model this Claude Code session runs on outside the skill's own turn, or None when unknown.
+    Agent hand-backs start new turns on it, so `model: opus` in SKILL.md doesn't cover them."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for f in glob.glob(str(HOME / "projects" / "*" / f"{sid}.jsonl")) if sid else []:
+        picked = None
+        for line in open(f, errors="replace"):
+            if "local-command-stdout>" not in line:
+                continue
+            try:
+                c = json.loads(line)["message"]["content"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(c, str) and c.startswith("<local-command-stdout>") and (m := re.search(r"(?:Set model to|Kept model as) `([^`]+)`", c)):
+                picked = m.group(1)
+        if picked:
+            return picked
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", os.environ["CLAUDE_PID"]], capture_output=True, text=True).stdout.split()
+        if "--model" in args[:-1]:
+            return args[args.index("--model") + 1]
+    except (KeyError, OSError, ValueError):
+        pass
+    # ponytail: settings.json holds the last /model from any session; a switch made elsewhere after this session started fools it
+    return os.environ.get("ANTHROPIC_MODEL") or load_json(HOME / "settings.json").get("model")
+
+
 def is_main(d):
     """A digest of a main Session, not a subagent's."""
     return "agentId" not in d
@@ -355,11 +382,11 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
 
 
 def instruction_files(dg):
-    """CLAUDE.md files over the line limit, or changed or grown during the Window."""
+    """CLAUDE.md and AGENTS.md files over the line limit, or changed or grown during the Window."""
     lo = dg["window"]["start"]
     lo_epoch = datetime.fromisoformat(lo.replace("Z", "+00:00")).timestamp()
     dirs = {Path(d["cwd"]) for d in dg["sessions"] if d.get("cwd") and is_main(d)}
-    paths = {HOME / "CLAUDE.md"} | {p / n for p in dirs for n in ("CLAUDE.md", ".claude/CLAUDE.md")}
+    paths = {HOME / "CLAUDE.md"} | {p / n for p in dirs for n in ("CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md")}
     out = []
     for f in sorted(paths):
         try:
@@ -669,6 +696,8 @@ def build_toolkit(dg):
     for f in sorted((HOME / "commands").glob("**/*.md")):
         add(":".join(f.relative_to(HOME / "commands").with_suffix("").parts), "user command", False, frontmatter(f).get("description"))
     for f in sorted((HOME / "agents").glob("*.md")):
+        if f.stem == "retro-worker":  # Retro's own agent, not part of the Toolkit
+            continue
         add("agent:" + (frontmatter(f).get("name") or f.stem), "user agent", True, frontmatter(f).get("description"))
     plugins = []
     for pid, inst in installed_plugins():
@@ -724,6 +753,37 @@ def agent_c_input(dg):
 
 AGENT_INPUTS = {"a": agent_a_input, "b": agent_b_input, "c": agent_c_input}
 AGENT_CATEGORIES = {"a": {"prompting", "rework"}, "b": {"repeats", "workflows"}, "c": {"skills", "overlap"}}
+RUBRIC_ITEMS = {"a": [f"P{i}" for i in range(1, 13)] + ["C2", "C3", "C6", "C8"],
+                "b": [f"W{i}" for i in range(1, 9)] + ["C5", "C6"],
+                "c": [f"S{i}" for i in range(1, 8)]}
+BRIEFS = Path(__file__).parent / "briefs"
+
+
+def rubric_slice(ids):
+    """An agent's rubric rows, verbatim, under their section heading and table header, with the section's notes."""
+    row_id = lambda l: (re.match(r"\| (\w+) \|", l) or [None, None])[1]
+    out, found = [], set()
+    for sec in re.split(r"(?m)^(?=## )", (Path(__file__).parent / "rubric.md").read_text()):
+        lines = sec.splitlines()
+        rows = {row_id(l) for l in lines} & set(ids)
+        if rows and lines[0].startswith("## "):
+            found |= rows
+            out.append("\n".join(l for l in lines if not l.startswith("|") or l.startswith(("| # |", "|---")) or row_id(l) in rows).strip())
+    if set(ids) - found:
+        sys.exit(f"rubric.md lacks items {sorted(set(ids) - found)}; fix RUBRIC_ITEMS in retro.py")
+    return "\n\n".join(out)
+
+
+def write_brief(tmp, a, input_name, slice_, piece):
+    """brief_<x>.md beside agent_<x>.json: the agent's instructions, its rubric rows and its input path."""
+    parts = [(BRIEFS / f"{a}.md").read_text(), (BRIEFS / "shared.md").read_text()]
+    if piece:
+        parts.append((BRIEFS / "piece.md").read_text())
+    if a != "c":  # C proposes installs, removals and habits, never a rule
+        parts.append((BRIEFS / "fixes.md").read_text())
+    text = "\n".join(parts + ["Your rubric items:\n", slice_ + "\n"])
+    text = text.replace("<input>", str(tmp / input_name)).replace("<temp folder>", str(tmp))
+    (tmp / input_name.replace("agent_", "brief_").replace(".json", ".md")).write_text(text)
 
 
 def previous_findings(redo):
@@ -1252,6 +1312,11 @@ def split_input(inp):
 
 
 def prepare(redo):
+    model = session_model()
+    if "opus" not in (model or "").lower():
+        print(f"Retro needs Opus: this session runs on {model or 'an unknown model'}, and agent hand-backs run on the session model. "
+              "Type `/model opus` (or start with `claude --model opus /retro`), then run /retro again.")
+        return
     hint = statusline_hint()
     start = now()
     if not redo:
@@ -1265,6 +1330,7 @@ def prepare(redo):
             if hint:
                 print(hint)
             return
+    slices = {a: rubric_slice(ids) for a, ids in RUBRIC_ITEMS.items()}  # before the temp folder, so a bad rubric leaves nothing behind
     dg = build_digest(start)
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
     start_insights(tmp)
@@ -1282,6 +1348,8 @@ def prepare(redo):
             splits[a] = names
         for nm, pc in zip(names, pieces):
             (tmp / nm).write_text(dumps(pc))
+            write_brief(tmp, a, nm, slices[a], piece=len(pieces) > 1)
+    (tmp / "brief_web.md").write_text((BRIEFS / "web.md").read_text().replace("<temp folder>", str(tmp)))
     (tmp / "splits.json").write_text(json.dumps(splits))
     (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
     up = build_upstream(dg, cursor(redo, start), first=prev is None)
