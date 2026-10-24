@@ -1,7 +1,8 @@
 ---
 name: retro
 model: opus
-description: Monthly self-review of how I use Claude Code. Use when the user types /retro or /retro redo.
+description: Reviews the last 30 days of Claude Code Sessions and writes a Findings file with fixes. Use when the user types /retro or /retro redo.
+disable-model-invocation: true
 ---
 
 # Retro
