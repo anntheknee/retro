@@ -10,8 +10,10 @@ allowed-tools: Bash(${CLAUDE_SKILL_DIR}/retro.py *)
 
 Run `${CLAUDE_SKILL_DIR}/retro.py` with Bash. The user never runs subcommands.
 
-1. Run `${CLAUDE_SKILL_DIR}/retro.py prepare` (or `${CLAUDE_SKILL_DIR}/retro.py prepare --redo` if the user typed `/retro redo`).
-2. Repeat its user-facing lines (the Opus refusal, the days-left refusal, or the plan-usage and format-drift lines) in your first message. If it printed the Opus refusal, stop there. If it printed days left, stop there, except for step 6.
+1. `prepare` has already run (with `redo` if the user typed `/retro redo`). Its output:
+
+   !`${CLAUDE_SKILL_DIR}/retro.py prepare $ARGUMENTS`
+2. Repeat the output's user-facing lines (the Opus refusal, the days-left refusal, or the plan-usage and format-drift lines) in your first message. If it printed the Opus refusal, stop there. If it printed days left, stop there, except for step 6.
 3. Otherwise it printed a temp folder holding `metrics.json`, `digest.json`, `agent_a.json`, `agent_b.json` (each replaced by numbered pieces when split: see Splitting), `agent_c.json`, a brief per agent input (`brief_a.md`, `brief_b.md`, `brief_c.md`, or `brief_a_1.md`, … per piece) and `brief_web.md`, `previous.json`, `upstream.json`, `news_raw.json`, `rubric_main.md`, `docs.txt` and `draft.md`, and `/insights` is already running in the background. Start Agents A, B and C in parallel, in one message (below), then read `metrics.json`, `rubric_main.md` (your rubric rows) and this skill's `briefs/fixes.md` (where each fix goes), and write Findings for context (2), cost (5) and permissions (7), using this layout. Merge A's, B's and C's Findings with yours under `## Findings` in `draft.md`: drop duplicates (same problem and fix; keep the better one), then number everything by weight. The script flags candidates and writes no Finding; you judge each one. Skip a category with nothing worth saying.
 
    ```

@@ -20,7 +20,7 @@ A Retro runs only when 30 days have passed since the previous one started. `/ret
 
 ## How a Retro runs
 
-1. **Prepare.** `retro.py prepare` checks that the session runs on Opus and the 30-day wait is over. It digests the transcripts, writes every input into a temp folder, and starts `/insights` in the background.
+1. **Prepare.** `SKILL.md` runs `retro.py prepare` through `!` injection, so it has run before Claude reads the skill. It checks that the session runs on Opus and the 30-day wait is over. It digests the transcripts, writes every input into a temp folder, and starts `/insights` in the background.
 2. **Analyze.** The main session starts three `retro-worker` agents in parallel. Each reads its brief and returns Findings for its categories. Meanwhile the main session writes the context, cost, and permissions Findings from the script's numbers.
 3. **Merge.** The main session merges all Findings into one draft, drops duplicates, and numbers them by weight. It also reviews the `/insights` report.
 4. **Search.** A web agent looks for better solutions to the most frequent problems and reads changelogs of outdated tools.

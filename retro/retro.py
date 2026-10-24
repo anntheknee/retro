@@ -1446,7 +1446,7 @@ def commit(draft):
 if __name__ == "__main__":
     cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
     if cmd == "prepare":
-        prepare("--redo" in args)
+        prepare(bool({"redo", "--redo"} & set(args)))  # `/retro redo` reaches here as $ARGUMENTS
     elif cmd == "status":
         status()
     elif cmd == "context" and len(args) in (2, 3):
@@ -1458,4 +1458,4 @@ if __name__ == "__main__":
     elif cmd == "commit" and args:
         commit(args[0])
     else:
-        sys.exit("usage: retro.py prepare [--redo] | context <session> <turn> [<temp folder>] | insights <temp folder> | news <temp folder> [<category>...] | commit <draft.md> | status")
+        sys.exit("usage: retro.py prepare [redo] | context <session> <turn> [<temp folder>] | insights <temp folder> | news <temp folder> [<category>...] | commit <draft.md> | status")
