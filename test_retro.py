@@ -36,4 +36,9 @@ assert hits("git branch -d merged") == []
 assert retro.SECRET.search("use key sk-ant-api03-" + "a" * 30)
 assert retro.SECRET.search("AKIA" + "A" * 16)
 assert not retro.SECRET.search("ask the skill to look at task-ant-colony")
+import tempfile, pathlib
+with tempfile.TemporaryDirectory() as d:
+    retro.write_brief(pathlib.Path(d), "a", "agent_a.json", "rows", piece=False)
+    brief = (pathlib.Path(d) / "brief_a.md").read_text()
+assert "<retro.py>" not in brief and f"{retro.__file__} context" in brief
 print("ok")

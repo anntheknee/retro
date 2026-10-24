@@ -829,6 +829,7 @@ def write_brief(tmp, a, input_name, slice_, piece):
         parts.append((BRIEFS / "fixes.md").read_text())
     text = "\n".join(parts + ["Your rubric items:\n", slice_ + "\n"])
     text = text.replace("<input>", str(tmp / input_name)).replace("<temp folder>", str(tmp))
+    text = text.replace("<retro.py>", str(Path(__file__)))
     (tmp / input_name.replace("agent_", "brief_").replace(".json", ".md")).write_text(text)
 
 
