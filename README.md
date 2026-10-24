@@ -17,7 +17,7 @@ The skill is these files in `retro/`:
 - `SKILL.md` holds the main session's steps. It names each `retro.py` call, the subagents to start, and the layout of the findings file.
 - `retro.py` is the helper script. It uses only the Python 3 standard library. Its thresholds are named constants, such as `GATE_DAYS` and `SPLIT_TOKENS`, and most of them are at the top of the file.
 - `briefs/` holds the subagents' instructions in parts. `prepare` joins the parts into one brief per subagent. `briefs/fixes.md` also says where each kind of fix belongs. CLAUDE.md loads into every Session, so a fix goes there only when no cheaper place, such as a hook, a lint rule, or a skill, can hold it.
-- `rubric.md` lists the practices a Retro checks, each with the anti-pattern to spot in a transcript and its source. Item IDs start with P for prompting, C for context, S for skills, and W for repeated workflows.
+- `rubric.md` lists the practices a Retro checks, each with the anti-pattern to spot in a transcript and its source. Item IDs start with P for prompting, C for context, S for skills, M for cost, A for permissions and safety, and W for repeated workflows.
 - `agents/retro-worker.md` defines the subagent type that every Retro subagent runs as. It allows only Bash, Read, WebFetch, WebSearch, and ToolSearch. It tells the agent not to edit files outside the temp folder or its scratchpad, and not to run git.
 
 ## A Retro from start to finish
@@ -27,7 +27,7 @@ The skill is these files in `retro/`:
 1. **Check.** The main session runs `retro.py prepare`, or `retro.py prepare --redo` for `/retro redo`. If the session doesn't run on Opus, or the 30-day wait isn't over, `prepare` prints a refusal. The main session repeats the refusal and stops.
 2. **Prepare.** `prepare` digests the Window's transcripts, writes every input the run needs into a new temp folder, and prints the folder's path. It also starts `/insights` in the background.
 3. **Phase 1.** The main session starts Agents A, B, and C in parallel, as `retro-worker` subagents on Opus. Each agent's whole prompt is `Read <temp folder>/brief_<x>.md and follow it.` Each agent first gives a verdict on the previous Retro's Findings in its own categories, then returns its new Findings. A split input gets one agent per piece.
-4. **The main session's share.** While the agents work, the main session writes the Findings for context, cost, and permissions from `metrics.json`. It also gives verdicts on the rest of the previous Retro's Findings and writes the Toolkit updates from `upstream.json`.
+4. **The main session's share.** While the agents work, the main session writes the Findings for context, cost, and permissions from `metrics.json` and `rubric_main.md`. It also gives verdicts on the rest of the previous Retro's Findings and writes the Toolkit updates from `upstream.json`.
 5. **Merge.** The main session merges the agents' Findings with its own under `## Findings` in `draft.md`. It drops duplicates and numbers the Findings by weight.
 6. **`/insights` review.** `retro.py insights` waits for the background run and extracts four sections of its report. The main session confirms, amends, merges, or drops each item. A confirmed or amended item becomes a Finding tagged `via /insights`.
 7. **Phase 2.** The main session picks the five or so most frequent problems and runs `retro.py news` with their categories. The web agent, a `retro-worker` on Sonnet, then searches for better solutions to those problems and reads the changelogs of outdated tools you used. The main session adds the web agent's solutions to the matching Findings, so that no Finding has more than three solutions. It puts the web agent's news items under `## Meta`.
@@ -51,7 +51,7 @@ A Retro sorts problems into nine categories. The three agents and the main sessi
 | 8 | `workflows` | Agent B | `agent_b.json` |
 | 9 | `overlap` | Agent C | `agent_c.json` |
 
-Each agent also gets its own rows from `rubric.md`, which `RUBRIC_ITEMS` in `retro.py` picks. The main session writes one more kind of `skills` Finding, for Owned Skills, from `upstream.json`.
+Each agent also gets its own rows from `rubric.md`, which `RUBRIC_ITEMS` in `retro.py` picks. The main session gets its rows, for context, cost, and permissions, in `rubric_main.md`. The main session writes one more kind of `skills` Finding, for Owned Skills, from `upstream.json`.
 
 ## What `retro.py` does
 
@@ -89,7 +89,7 @@ A flagged turn also keeps the last 300 characters of Claude's previous reply, so
 
 The digest leaves out the Retro itself. A typed `/retro` cuts its Session at that prompt, and the cut applies to that Session's subagents too. The digest also drops the headless `/usage` and `/insights` Sessions that a Retro starts.
 
-Transcripts are an internal format that changes between Claude Code versions. `prepare` skips each record it can't parse or whose type it doesn't know, and prints their count as format drift. Only the script parses transcripts. The agents read slices of the digest, and Agent A runs `retro.py context` when it needs a whole turn. There are no automated tests, so the drift count is the only automatic sign that the parser has fallen behind.
+Transcripts are an internal format that changes between Claude Code versions. `prepare` skips each record it can't parse or whose type it doesn't know, and prints their count as format drift. Only the script parses transcripts. The agents read slices of the digest, and Agent A runs `retro.py context` when it needs a whole turn. `test_retro.py` checks only the docs commands parser and the safety patterns, so the drift count is the only automatic sign that the transcript parser has fallen behind.
 
 #### The temp folder holds every input
 
@@ -106,12 +106,14 @@ Transcripts are an internal format that changes between Claude Code versions. `p
 | `brief_a.md`, `brief_b.md`, `brief_c.md` | Each agent's whole instructions | Agents A, B, and C |
 | `brief_web.md` | The web agent's instructions | Web agent |
 | `splits.json` | The piece files of each split input, or `{}` when nothing was split | Main session |
+| `docs.txt` | The current Claude Code docs, the full text of every page, from `llms-full.txt` | Every agent and the main session, by grep |
+| `rubric_main.md` | The main session's rubric rows | Main session |
 | `previous.json` | The previous Retro's Findings, Toolkit updates, and Meta, or `null` before the first Retro | Main session |
 | `upstream.json` | Everything behind upstream, with update commands | Main session, web agent, and `news` |
 | `news_raw.json` | News items newer than the previous Retro | `news` |
 | `draft.md` | The findings file with empty sections | Main session, then `commit` |
 
-`metrics.json` also lists each CLAUDE.md and AGENTS.md file that is over 200 lines or changed during the Window. Later, `insights` adds `insights.json` and `news` adds `news.json`. The background `/insights` run writes its own output files to the same folder.
+`metrics.json` also lists each CLAUDE.md and AGENTS.md file that is over 200 lines or changed during the Window, the turns you waited 5 minutes or more through, the Sessions run in bypass mode, the destructive git commands run and the settings files with a Bash `PreToolUse` hook, and the Session and turn of each typed prompt that looks like it holds a secret. It never copies the secret. Later, `insights` adds `insights.json` and `news` adds `news.json`. The background `/insights` run writes its own output files to the same folder.
 
 When it finishes, `prepare` prints the format-drift count, your plan usage from `claude -p /usage`, and the temp folder's path. It also prints a line for each split input, and a statusline hint if your statusline lacks `retro.py status`.
 
@@ -127,7 +129,7 @@ Agent B's input holds the same prompts plus repeat candidates that the script fi
 
 The candidates are leads. Agent B confirms each one against the prompts.
 
-Agent C's input holds the Toolkit table, every typed prompt, and the slash names you typed that match nothing installed. The table has one row per skill, command, and agent, with its origin, its description, its uses in the Window, and its lifetime uses from `~/.claude.json`. It also marks each plugin as used or unused, and flags an unused plugin that ships hooks, because transcripts don't show hook use. `prepare` builds the table from these places:
+Agent C's input holds the Toolkit table, every typed prompt, and the slash names you typed that match nothing installed. If the docs download fails, the built-in commands are unknown, so `prepare` leaves that list empty and records the failure in `upstream.json`. The table has one row per skill, command, and agent, with its origin, its description, its uses in the Window, and its lifetime uses from `~/.claude.json`. It also marks each plugin as used or unused, and flags an unused plugin that ships hooks, because transcripts don't show hook use. `prepare` builds the table from these places:
 
 - `~/.claude/skills/`, where each symlinked skill is traced to the skills CLI lock file, `~/.agents/.skill-lock.json`
 - claude.ai synced skills, from `~/.claude/skills/synced/`
@@ -135,7 +137,7 @@ Agent C's input holds the Toolkit table, every typed prompt, and the slash names
 - `~/.claude/commands/` and `~/.claude/agents/`, except `retro-worker`
 - installed plugins, from `~/.claude/plugins/installed_plugins.json`
 - bundled skills, from the skill listings in transcripts
-- built-in commands, from `BUILTIN_COMMANDS` in `retro.py`
+- built-in commands, bundled skills and bundled workflows, with their descriptions and aliases, from the commands table in `docs.txt`
 
 Each input also carries `previous_findings`, which holds the previous Retro's Findings in that agent's categories.
 
@@ -191,7 +193,7 @@ The main session starts one agent per piece, then one reconcile agent per split 
 
 `retro.py news <temp folder> <category>...` scores each item in `news_raw.json` against a word list. The word list has four parts:
 
-- the names of your Toolkit items, other than built-in commands
+- the names of your Toolkit items, other than built-in commands and bundled skills and workflows
 - the names of your plugins and installed CLIs
 - Claude Code words such as `hook` and `mcp`
 - the words that `CATEGORY_TERMS` gives each category you name
@@ -247,7 +249,7 @@ Each Window is the 30 days before its Retro, and Retros are at least 30 days apa
 
 Most failures don't stop a Retro. The main session lists each of these under `## Failed parts` and goes on:
 
-- an upstream check or news source that failed, from the `errors` lists in `upstream.json` and `news_raw.json`
+- an upstream check, the docs download, or a news source that failed, from the `errors` lists in `upstream.json` and `news_raw.json`
 - a failed `/insights` run, from `insights.json`
 - an agent that crashed, timed out, or returned garbled output
 

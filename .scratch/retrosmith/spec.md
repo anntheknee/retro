@@ -202,7 +202,7 @@ Each Finding names a problem and up to three self-contained solutions. I apply o
 
 - Each agent also gets the previous Findings in its categories and checks their follow-through.
 - Agents return Findings in the findings-file Finding layout, without numbers.
-- The 42-item rubric (12 prompt quality, 15 context, 7 skills, 8 workflows) ships with the skill. Each item names its anti-pattern, whether it's script- or LLM-detected, and its source. Built-in thresholds:
+- The 55-item rubric (12 prompt quality, 17 context, 7 skills, 4 cost, 7 permissions and safety, 8 workflows) ships with the skill. Each item names its anti-pattern, whether it's script- or LLM-detected, and its source. Built-in thresholds:
   - `/clear` after two failed corrections;
   - a mistake made twice goes into CLAUDE.md;
   - a playbook pasted three times becomes a skill;

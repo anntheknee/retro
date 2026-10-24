@@ -1,6 +1,6 @@
 # Retro rubric
 
-A rubric for problem categories (1) prompt quality, (2) context management, (3) using skills you have, and (8) turning repeated workflows into skills. Each item gives the practice, the anti-pattern a Retro can spot in a Session transcript, and the source. **Detect** marks whether plain code in the helper script can find the signal (`script`) or whether it needs LLM judgment (`LLM`). This follows the map's standing preference that the script does the heavy lifting.
+A rubric for problem categories (1) prompt quality, (2) context management, (3) using skills you have, (5) cost, (7) permissions and safety, and (8) turning repeated workflows into skills. Each item gives the practice, the anti-pattern a Retro can spot in a Session transcript, and the source. **Detect** marks whether plain code in the helper script can find the signal (`script`) or whether it needs LLM judgment (`LLM`). This follows the map's standing preference that the script does the heavy lifting.
 
 ## Sources
 
@@ -18,6 +18,17 @@ All primary. Short keys are used in the tables.
 | PE | Claude API docs, [Prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) |
 | SAB | Claude API docs, [Skill authoring best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices) |
 | CE | Anthropic Engineering, [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) (2025-09-29) |
+| MC | Claude Code docs, [Model configuration](https://code.claude.com/docs/en/model-config) |
+| FM | Claude Code docs, [Fast mode](https://code.claude.com/docs/en/fast-mode) |
+| PERM | Claude Code docs, [Configure permissions](https://code.claude.com/docs/en/permissions) |
+| PM | Claude Code docs, [Permission modes](https://code.claude.com/docs/en/permission-modes) |
+| SBX | Claude Code docs, [Sandboxing](https://code.claude.com/docs/en/sandboxing) |
+| HK | Claude Code docs, [Hooks reference](https://code.claude.com/docs/en/hooks) |
+| HG | Claude Code docs, [Automate workflows with hooks](https://code.claude.com/docs/en/hooks-guide) |
+| CMD | Claude Code docs, [Commands](https://code.claude.com/docs/en/commands) |
+| AV | Claude Code docs, [Agent view](https://code.claude.com/docs/en/agent-view) |
+| CWF | Claude Code docs, [Common workflows](https://code.claude.com/docs/en/common-workflows) |
+| ST | Claude Code docs, [Scheduled tasks](https://code.claude.com/docs/en/scheduled-tasks) |
 | AS | Anthropic Engineering, [Equipping agents for the real world with Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills) (2025-10-16) |
 
 The single principle under most of the rubric: "Claude's context window fills up fast, and performance degrades as it fills" (BP, intro). CE calls the same effect "context rot" and states the goal as "the smallest set of high-signal tokens that maximize the likelihood of your desired outcome."
@@ -60,6 +71,8 @@ Caveat from BP ("Develop your intuition"): vague prompts are fine when exploring
 | C13 | Prefer CLIs (`gh`, `aws`) over MCP where available, and disable unused MCP servers. | MCP servers connected but never called in the Window. MCP calls used where an installed CLI would do. | script (configured servers vs. calls) | [COST#reduce-mcp-server-overhead](https://code.claude.com/docs/en/costs#reduce-mcp-server-overhead); [BP#use-cli-tools](https://code.claude.com/docs/en/best-practices#use-cli-tools) |
 | C14 | For long multi-window work, keep state in files (progress notes, a structured test list, git). Starting fresh from that state can beat compaction. | A long task carried across compactions with no progress file or commits, and Claude loses the thread. | LLM | [PE#workflows-across-multiple-context-windows](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices#workflows-across-multiple-context-windows); [CE "structured note-taking"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) |
 | C15 | Use a fresh context for review (a writer/reviewer split, or a reviewer subagent). Tell the reviewer to flag only correctness gaps. | Claude reviews its own just-written code in the same context. The opposite also counts: chasing every reviewer nit into over-engineering. | LLM | [BP#run-multiple-claude-sessions](https://code.claude.com/docs/en/best-practices#run-multiple-claude-sessions); [BP#add-an-adversarial-review-step](https://code.claude.com/docs/en/best-practices#add-an-adversarial-review-step) |
+| C16 | Don't sit through long turns: send long work to the background (`/background`, background subagents, `/tasks`), get pinged by a Notification hook, or run a second Session in a worktree. | Many foreground turns of 5+ minutes the user waited through. | script (`context.long_turns`, from each turn's `ms`) + LLM | [AV](https://code.claude.com/docs/en/agent-view); [SA#run-subagents-in-foreground-or-background](https://code.claude.com/docs/en/sub-agents#run-subagents-in-foreground-or-background); [HG#get-notified-when-claude-needs-input](https://code.claude.com/docs/en/hooks-guide#get-notified-when-claude-needs-input); [CWF#run-parallel-sessions-with-worktrees](https://code.claude.com/docs/en/common-workflows#run-parallel-sessions-with-worktrees) |
+| C17 | Let Claude do the polling: `/loop` for a recurring check in the Session, `/schedule` for a cloud scheduled task. | The user types "check again" or "is it done yet" prompts one after another. | LLM | [ST#run-a-prompt-repeatedly-with-loop](https://code.claude.com/docs/en/scheduled-tasks#run-a-prompt-repeatedly-with-loop); [CMD](https://code.claude.com/docs/en/commands) (`/schedule`) |
 
 ## (3) Using skills you have
 
@@ -72,6 +85,27 @@ Caveat from BP ("Develop your intuition"): vague prompts are fine when exploring
 | S5 | Re-invoke a skill after compaction, or when Claude stops following it. Compaction keeps only the start of each invoked skill (5k tokens each, 25k total). Put key rules at the top of SKILL.md. | A skill's rules are obeyed early in a Session and dropped after a compaction boundary. | script (skill invoked before a compaction boundary and not after) + LLM | [SK#claude-stops-following-a-skill](https://code.claude.com/docs/en/skills#claude-stops-following-a-skill); [CW#what-survives-compaction](https://code.claude.com/docs/en/context-window#what-survives-compaction) |
 | S6 | Use bundled skills and built-ins before hand-rolling: `/code-review`, `/batch`, `/debug`, `/loop`, `/verify`, `/doctor`, and the built-in Explore/Plan subagents. | The user hand-writes a review or fan-out prompt that a bundled skill already covers. | LLM | [SK "Bundled skills"](https://code.claude.com/docs/en/skills); [SA "Built-in subagents"](https://code.claude.com/docs/en/sub-agents) |
 | S7 | Set `disable-model-invocation: true` on side-effecting skills. It also keeps their description out of context. | A deploy, commit, or publish-style skill that Claude can auto-invoke. | script (frontmatter check) | [SK "Controlling invocation"](https://code.claude.com/docs/en/skills); [FO#context-cost-by-feature](https://code.claude.com/docs/en/features-overview#context-cost-by-feature) |
+
+## (5) Cost
+
+| # | Practice | Anti-pattern to spot | Detect | Source |
+|---|---|---|---|---|
+| M1 | Match the model to the task: Sonnet for most coding, Opus for hard design or multi-step reasoning. `opusplan` plans with Opus and executes with Sonnet. | Routine edits and lookups run on Opus all month: `cost.by_model` puts nearly all tokens on Opus, with no `/model` switch. | script (`cost.by_model`) + LLM | [COST#choose-the-right-model](https://code.claude.com/docs/en/costs#choose-the-right-model); [MC#opusplan-model-setting](https://code.claude.com/docs/en/model-config#opusplan-model-setting) |
+| M2 | Set the effort level per task with `/effort`: lower for routine work, higher only for hard problems. Use `ultrathink` for one deep turn. | `max` or `xhigh` effort on routine Sessions: `cost.by_effort` puts most tokens on the top level. | script (`cost.by_effort`) + LLM | [MC#adjust-effort-level](https://code.claude.com/docs/en/model-config#adjust-effort-level); [COST#adjust-extended-thinking](https://code.claude.com/docs/en/costs#adjust-extended-thinking) |
+| M3 | Choose a subagent's model on purpose: `model` in its frontmatter or per Agent call (`haiku` or `sonnet` for simple jobs). With neither, it inherits the main conversation's model. | Search or research subagents that inherit Opus at high effort: `cost.expensive_subagents` led by simple jobs. | script (`cost.expensive_subagents`) + LLM | [SA#choose-a-model](https://code.claude.com/docs/en/sub-agents#choose-a-model); [COST#choose-the-right-model](https://code.claude.com/docs/en/costs#choose-the-right-model) |
+| M4 | Turn fast mode on for latency-critical interactive work only. It has higher per-token pricing. | Fast mode (`/fast`) left on through long or unattended work. | LLM | [FM#understand-the-cost-tradeoff](https://code.claude.com/docs/en/fast-mode#understand-the-cost-tradeoff); [FM#decide-when-to-use-fast-mode](https://code.claude.com/docs/en/fast-mode#decide-when-to-use-fast-mode) |
+
+## (7) Permissions and safety
+
+| # | Practice | Anti-pattern to spot | Detect | Source |
+|---|---|---|---|---|
+| A1 | Add allow rules for prompts you answer again and again, with `/permissions` or the bundled `/fewer-permission-prompts` skill. | The same tool or command approved by hand many times in the Window. | script (`permissions.prompted_by_tool`) | [PERM#manage-permissions](https://code.claude.com/docs/en/permissions#manage-permissions); [CMD](https://code.claude.com/docs/en/commands) (`/fewer-permission-prompts`) |
+| A2 | Let auto mode handle routine approvals, and tune it with `/auto-mode-setup`. | Many prompts answered in `default` or `acceptEdits` Sessions for actions auto mode would allow. | script (`permissions.prompts_answered`) + LLM | [PM#eliminate-permission-prompts-with-auto-mode](https://code.claude.com/docs/en/permission-modes#eliminate-permission-prompts-with-auto-mode); [CMD](https://code.claude.com/docs/en/commands) (`/auto-mode-setup`) |
+| A3 | Run Bash in the sandbox (`/sandbox`): filesystem and network isolation with fewer prompts. | Many Bash prompts in Sessions with the sandbox off. | LLM | [SBX#what-the-sandbox-restricts](https://code.claude.com/docs/en/sandboxing#what-the-sandbox-restricts); [SBX#sandbox-modes](https://code.claude.com/docs/en/sandboxing#sandbox-modes) |
+| A4 | Keep deliberate denials denied. A deny rule, or a prompt the user keeps rejecting, is a choice, not friction. | A fix that would allow a command the user keeps denying. | LLM | [PERM#permission-system](https://code.claude.com/docs/en/permissions#permission-system) |
+| A5 | Never paste secrets into prompts. Keep them in env vars or files Claude can't read: a `Read(./.env)` deny rule, or `sandbox.credentials`. | A typed prompt holding an API key, token or private key. Report only the Session and turn; never copy the secret into any output. | script (`permissions.secrets_in_prompts`) | [PERM#use-specifiers-for-fine-grained-control](https://code.claude.com/docs/en/permissions#use-specifiers-for-fine-grained-control); [SBX#protect-credentials](https://code.claude.com/docs/en/sandboxing#protect-credentials) |
+| A6 | Use `bypassPermissions` (`--dangerously-skip-permissions`) only in isolated containers and VMs. | Sessions in bypass mode on the user's own machine. | script (`permissions.bypass_sessions`) + LLM | [PM#available-modes](https://code.claude.com/docs/en/permission-modes#available-modes); [PM#skip-all-checks-with-bypasspermissions-mode](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode) |
+| A7 | Guard destructive commands with a `PreToolUse` hook that denies them (`git push --force`, `git reset --hard`, `git clean -f`, `git branch -D`). | Destructive git commands run with no Bash `PreToolUse` hook in any settings file. A guardrail skill in the Toolkit, if any, is the fix. | script (`permissions.destructive_git`, `permissions.bash_guard_hooks`) | [HK#how-a-hook-resolves](https://code.claude.com/docs/en/hooks#how-a-hook-resolves) |
 
 ## (8) Turning repeated workflows into skills or commands
 

@@ -11,3 +11,5 @@ Then return only Findings in this layout, with your categories, no numbers, orig
 ```
 
 Up to three self-contained solutions each. No evidence lines, no status. Skip a category with nothing worth saying.
+
+`<temp folder>/docs.txt` is the current Claude Code docs: the full text of every page, each starting `# <title>` then `Source: <url>`. Grep it; never read it whole. Before you name a command, setting, flag, hook event or feature in a solution, confirm it there and put its Source URL at the end of the solution's Adoption note. If the file is missing, go on without it.

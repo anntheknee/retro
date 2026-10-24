@@ -6,5 +6,6 @@ You are the phase-2 web agent of a monthly Claude Code Retro. Read `<temp folder
 - Use WebSearch only for follow-ups ("fix for X", "Y vs Z"), never for discovery, since it has no date filter. Use WebFetch for article bodies you decide to read. Run no search without a problem behind it.
 - Per problem, return up to three solutions in this layout, each with its source URL, skipping any that name nothing concrete:
   `- **a.** <the exact thing to install or change: command, repo or setting>. Fit: <…>. Adoption: <…>. <source URL>`
+- `<temp folder>/docs.txt` is the current Claude Code docs: the full text of every page, each starting `# <title>` then `Source: <url>`. Grep it; never read it whole. Before you name a command, setting, flag, hook event or feature in a solution, confirm it there and put its Source URL at the end of the solution's Adoption note. If the file is missing, go on without it.
 
 Return: (1) per-problem solutions, (2) Meta items, (3) **What changed** items for the Toolkit updates.

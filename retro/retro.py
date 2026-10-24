@@ -35,12 +35,15 @@ KNOWN_TYPES = {
     "pr-link", "custom-title",
 }
 
-# Built-in slash commands users type; not on disk, so listed here. Bundled skills come from the skill listing.
-BUILTIN_COMMANDS = ["clear", "compact", "context", "cost", "doctor", "help", "init", "insights", "model", "rewind",
-                    "resume", "review", "usage", "config", "memory", "permissions", "plan", "btw", "rename",
-                    "status", "mcp", "agents", "hooks", "login", "logout", "export", "vim", "add-dir", "terminal-setup",
-                    "bug", "output-style", "statusline", "ide", "pr-comments", "release-notes", "theme", "fast", "color",
-                    "effort", "new", "plugin", "reload-plugins", "skills", "rc", "diff", "skill-doctor", "opusplan"]
+# Full text of every docs page: the agents grep it, and its commands table names the built-in commands.
+DOCS_URL = "https://code.claude.com/docs/llms-full.txt"
+DOC_ORIGINS = ("built-in command", "bundled skill", "bundled workflow")
+LONG_TURN_MS = 5 * 60_000  # a turn the user waited this long through
+# ponytail: common key shapes only, and prompts are cut at PROMPT_MAX; widen if a leak slips past
+SECRET = re.compile(r"sk-ant-[\w-]{20,}|\bsk-[A-Za-z0-9]{32,}|\bgh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}|\bAKIA[0-9A-Z]{16}\b"
+                    r"|\bxox[abprs]-[\w-]{10,}|\bAIza[\w-]{35}|-----BEGIN [A-Z ]*PRIVATE KEY-----")
+DESTRUCTIVE = {"git push --force": r"git\s+push\b[^;&|\n]*\s(?:--force(?!-)|-f)\b", "git reset --hard": r"git\s+reset\s+--hard",
+               "git clean -f": r"git\s+clean\s+-\w*f", "git branch -D": r"git\s+branch\s+(?:-\w+\s+)*-D\b"}
 
 SKELETON = """Sessions: {sessions} · Projects: {projects} · Findings: 0
 
@@ -164,6 +167,12 @@ def command_words(cmd):
     return words
 
 
+def destructive(cmd):
+    """DESTRUCTIVE keys of the git commands a Bash string runs, not ones it only mentions (a heredoc, an echo)."""
+    segs = re.split(r"&&|\|\||[;|\n]", cmd)
+    return [k for k, rx in DESTRUCTIVE.items() if any(re.match(r"\s*" + rx, s) for s in segs)]
+
+
 def text_of(c):
     if isinstance(c, str):
         return c
@@ -232,7 +241,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
          "perm_modes": collections.Counter(), "denied": collections.Counter(),
          "prompted_by": collections.Counter(), "tokens_by_model": collections.defaultdict(collections.Counter),
          "tokens_by_effort": collections.defaultdict(collections.Counter), "cache_heavy": [],
-         "ctx_sum": 0, "first_ctx": 0, "tool_seq": [], "agent_prompts": []}
+         "ctx_sum": 0, "first_ctx": 0, "tool_seq": [], "agent_prompts": [], "destructive": collections.Counter()}
     tool_by_uuid = {}
     listing = None
     reqs, cur, first, last, cut, drift, seen_user = {}, None, None, None, None, 0, False
@@ -306,6 +315,7 @@ def digest_session(path, lo, hi, parent_cut=None, full=False):
                                 d["bash_words"].update(command_words(" ".join(cmd)))
                                 head = " ".join(cmd[:2]) if cmd[0] in ("git", "gh", "npm", "uv", "claude", "openspec") else cmd[0]
                                 d["bash_heads"][head] += 1
+                                d["destructive"].update(destructive(inp["command"]))
                         tool_by_uuid[r.get("uuid")] = tool_by_uuid[c.get("id")] = f"{n} {head}".strip()
                         if len(d["tool_seq"]) < SEQ_MAX:
                             d["tool_seq"].append(tool_by_uuid[c.get("id")])
@@ -421,6 +431,8 @@ def compute_metrics(dg):
 
     rows = [row(d) for d in mains if d["requests"]]
     no_clear = [d["file"] for d in mains if d["interrupts"] >= 2 and not d["slash"].get("clear")]
+    waits = [{"file": d["file"], "ts": t["ts"], "minutes": round(t["ms"] / 60_000), "prompt": t["prompt"][:80]}
+             for d in mains for t in d["turns"] if (t.get("ms") or 0) >= LONG_TURN_MS]
     context = {
         "sessions": len(rows),
         "mean_peak_ctx": sum(r["peak_ctx"] for r in rows) // max(len(rows), 1),
@@ -430,6 +442,7 @@ def compute_metrics(dg):
         "long_sessions": sorted([r for r in rows if r["turns"] >= LONG_TURNS], key=lambda r: -r["turns"])[:15],
         "instruction_files": instruction_files(dg),
         "rubric_candidates": [f"{len(no_clear)} Sessions had 2+ interrupts and no /clear: {no_clear[:10]}"] if no_clear else [],
+        "long_turns": {"count": len(waits), "minutes": sum(t["minutes"] for t in waits), "top": sorted(waits, key=lambda t: -t["minutes"])[:10]},
     }
     by_project, by_model, by_effort = (collections.defaultdict(collections.Counter) for _ in range(3))
     usd_project, skill_out = collections.Counter(), collections.Counter()
@@ -466,9 +479,26 @@ def compute_metrics(dg):
         denied.update(d["denied"])
         prompted.update(d["prompted_by"])
         kinds.update(d["denials"])
+    destructive = sum((d["destructive"] for d in ss), collections.Counter())
     permissions = {"prompts_answered": sum(prompted.values()), "prompted_by_tool": top(prompted),
-                   "denied_by_tool_and_kind": top(denied), "denial_kinds": dict(kinds)}
+                   "denied_by_tool_and_kind": top(denied), "denial_kinds": dict(kinds),
+                   # where only: never copy the matched text into any output
+                   "secrets_in_prompts": [{"file": d["file"], "turn": i} for d in mains for i, t in enumerate(d["turns"])
+                                          if SECRET.search(" ".join([t["prompt"], *t.get("steering", [])]))],
+                   "bypass_sessions": [d["file"] for d in mains if d["perm_modes"].get("bypassPermissions")],
+                   "destructive_git": dict(destructive), "bash_guard_hooks": bash_guard_hooks(dg) if destructive else None}
     return {"context": context, "cost": cost, "permissions": permissions}
+
+
+def bash_guard_hooks(dg):
+    """Settings files with a PreToolUse hook whose matcher covers Bash."""
+    dirs = {HOME} | {Path(d["cwd"]) / ".claude" for d in dg["sessions"] if d.get("cwd") and is_main(d)}
+    out = []
+    for f in sorted(p / n for p in dirs for n in ("settings.json", "settings.local.json")):
+        hooks = (load_json(f).get("hooks") or {}).get("PreToolUse") or []
+        if any(re.search(r"Bash|^\*?$", h.get("matcher") or "") for h in hooks if isinstance(h, dict)):
+            out.append(str(f))
+    return out
 
 
 def context(session, turn, tmp=None):
@@ -720,11 +750,25 @@ def build_toolkit(dg):
         has_hooks = (root / "hooks").exists()
         status = "used" if used else (("hooks only, can't tell" if not names else "unused, but ships hooks") if has_hooks else "unused")
         plugins.append({"plugin": pid, "version": inst.get("version"), "items": names, "uses": used, "status": status})
+    for n, origin, desc in dg.get("doc_commands") or []:  # before the listing, so a bundled skill keeps its description
+        add(n, origin, origin != "built-in command", desc)
     for n in dg["skill_listings"]:
         add(n, "bundled or built-in (skill listing)", True, None)
-    for n in BUILTIN_COMMANDS:
-        add(n, "built-in command", False, None)
     return {"items": sorted(rows.values(), key=lambda r: r["name"]), "plugins": plugins}
+
+
+def doc_commands(docs):
+    """(name, origin, description) per row of the commands page's table in docs.txt, aliases included."""
+    page = docs.partition("Source: https://code.claude.com/docs/en/commands\n")[2].split("\nSource: ")[0]
+    out = []
+    for m in re.finditer(r"(?m)^\| `/([\w:-]+)[^`]*` \| (.*) \|$", page):
+        desc = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", m.group(2)).replace("\\|", "|")
+        kind = re.match(r"\*\*(Skill|Workflow)\.\*\* ", desc)
+        origin = f"bundled {kind.group(1).lower()}" if kind else "built-in command"
+        desc = desc[kind.end():] if kind else desc
+        aliases = re.findall(r"`/([\w:-]+)`", " ".join(re.findall(r"(?:Alias(?:es)?:|Also available as)[^.|]*", desc)))
+        out += [(n, origin, desc) for n in [m.group(1), *aliases]]
+    return out
 
 
 def dead_slash(dg, items):
@@ -748,14 +792,16 @@ def agent_c_input(dg):
     prompts = [{"session": d["file"], "project": d.get("cwd"), "prompts": [t["prompt"] for t in d["turns"]]}
                for d in dg["sessions"] if is_main(d) and d["turns"]]
     tk = build_toolkit(dg)
-    return {**tk, "dead_slash": dead_slash(dg, tk["items"]), "sessions": prompts}
+    # without the docs every built-in typed would look dead, so skip it (prepare reports why)
+    return {**tk, "dead_slash": dead_slash(dg, tk["items"]) if dg.get("doc_commands") else {}, "sessions": prompts}
 
 
 AGENT_INPUTS = {"a": agent_a_input, "b": agent_b_input, "c": agent_c_input}
 AGENT_CATEGORIES = {"a": {"prompting", "rework"}, "b": {"repeats", "workflows"}, "c": {"skills", "overlap"}}
 RUBRIC_ITEMS = {"a": [f"P{i}" for i in range(1, 13)] + ["C2", "C3", "C6", "C8"],
                 "b": [f"W{i}" for i in range(1, 9)] + ["C5", "C6"],
-                "c": [f"S{i}" for i in range(1, 8)]}
+                "c": [f"S{i}" for i in range(1, 8)],
+                "main": ["C1", "C4", "C7"] + [f"C{i}" for i in range(9, 18)] + [f"M{i}" for i in range(1, 5)] + [f"A{i}" for i in range(1, 8)]}
 BRIEFS = Path(__file__).parent / "briefs"
 
 
@@ -1280,7 +1326,7 @@ def news(tmp, categories=()):
     unknown = [x for x in categories if x not in CATEGORY_TERMS]
     if unknown:
         print("unknown categories ignored: " + ", ".join(unknown), file=sys.stderr)
-    terms = {i["name"] for i in c.get("items", []) if i["name"] not in BUILTIN_COMMANDS} | {p["plugin"].split("@")[0] for p in c.get("plugins", [])}
+    terms = {i["name"] for i in c.get("items", []) if i["origin"] not in DOC_ORIGINS} |{p["plugin"].split("@")[0] for p in c.get("plugins", [])}
     terms |= set((load_json(tmp / "upstream.json").get("clis") or {}).get("installed", []))
     terms |= set(PLATFORM_TERMS) | {t for cat in categories for t in CATEGORY_TERMS.get(cat, [])}
     out = {"items": score_news(raw["items"], terms), "html_sources": raw["html_sources"], "errors": raw["errors"]}
@@ -1334,6 +1380,14 @@ def prepare(redo):
     dg = build_digest(start)
     tmp = Path(tempfile.mkdtemp(prefix="retro-"))
     start_insights(tmp)
+    docs_err = None
+    try:
+        (tmp / "docs.txt").write_text(http_get(DOCS_URL))
+        dg["doc_commands"] = doc_commands((tmp / "docs.txt").read_text())
+        if not dg["doc_commands"]:
+            docs_err = "docs: no commands table in docs.txt, so built-in commands are unknown and dead_slash was skipped"
+    except Exception as e:  # no network: the Retro goes on without docs.txt
+        docs_err = f"docs: {e}; no docs.txt, so built-in commands are unknown and dead_slash was skipped"
     (tmp / "state.json").write_text(json.dumps({"redo": redo, "timestamp": start.isoformat()}))
     (tmp / "digest.json").write_text(dumps(dg))
     prev = previous_findings(redo)
@@ -1352,7 +1406,9 @@ def prepare(redo):
     (tmp / "brief_web.md").write_text((BRIEFS / "web.md").read_text().replace("<temp folder>", str(tmp)))
     (tmp / "splits.json").write_text(json.dumps(splits))
     (tmp / "previous.json").write_text(json.dumps(prev, separators=(",", ":")))
+    (tmp / "rubric_main.md").write_text(slices["main"] + "\n")
     up = build_upstream(dg, cursor(redo, start), first=prev is None)
+    up["errors"] += [docs_err] if docs_err else []
     (tmp / "upstream.json").write_text(json.dumps(up, separators=(",", ":")))
     (tmp / "news_raw.json").write_text(json.dumps(fetch_news(cursor(redo, start)), separators=(",", ":")))
     (tmp / "draft.md").write_text(SKELETON.format(sessions=dg["n_sessions"], projects=dg["n_projects"]))
