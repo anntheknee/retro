@@ -14,7 +14,7 @@ A Retro runs only when 30 days have passed since the previous one started. `/ret
 |---|---|
 | `retro/SKILL.md` | The steps the main session follows |
 | `retro/retro.py` | Helper script, Python 3 standard library only. The main session runs it. You don't |
-| `retro/briefs/` | Instructions for the subagents, joined into one brief per agent |
+| `retro/briefs/` | Instructions for the subagents, joined into one brief per agent, plus `splitting.md`, `failures.md` and `toolkit.md`, which the main session reads only when needed |
 | `retro/rubric.md` | The practices a Retro checks, each with the anti-pattern to spot and its source |
 | `retro/agents/retro-worker.md` | The subagent type every Retro subagent runs as |
 
@@ -22,8 +22,8 @@ A Retro runs only when 30 days have passed since the previous one started. `/ret
 
 1. **Prepare.** `SKILL.md` runs `retro.py prepare` through `!` injection, so it has run before Claude reads the skill. It checks that the session runs on Opus and the 30-day wait is over. It digests the transcripts, writes every input into a temp folder, and starts `/insights` in the background.
 2. **Analyze.** The main session starts three `retro-worker` agents in parallel. Each reads its brief and returns Findings for its categories. Meanwhile the main session writes the context, cost, and permissions Findings from the script's numbers.
-3. **Merge.** The main session merges all Findings into one draft, drops duplicates, and numbers them by weight. It also reviews the `/insights` report.
-4. **Search.** A web agent looks for better solutions to the most frequent problems and reads changelogs of outdated tools.
+3. **Merge.** The main session merges all Findings into one draft, drops duplicates, and reviews the `/insights` report. The review reads four sections of the report and ignores the rest: friction, features, patterns and horizon. Each item in them (a friction category, a suggested CLAUDE.md line, a feature or pattern, a horizon idea) gets one verdict: confirm or amend it into a Finding tagged `via /insights`, merge it into an existing Finding, or drop it with a reason.
+4. **Search.** A web agent looks for better solutions to the most frequent problems and reads changelogs of outdated tools. The main session then numbers all Findings by weight.
 5. **Commit.** `retro.py commit` writes `findings.md`, deletes the temp folder, and opens the file.
 
 | Category | Covered by |
